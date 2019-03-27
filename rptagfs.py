@@ -108,7 +108,7 @@ def flag2mode(flags):
     return m
 
 
-class Xmp(fuse.Fuse):
+class RPTagFS(fuse.Fuse):
     def __init__(self, *args, **kw):
         fuse.Fuse.__init__(self, *args, **kw)
         # do stuff to set up your filesystem here, if you want
@@ -345,7 +345,7 @@ class Xmp(fuse.Fuse):
     def fsinit(self):
         os.chdir(self.root)
 
-    class XmpFile(object):
+    class RPTagFSFile(object):
         def __init__(self, path, flags, *mode):
             bn = os.path.basename(path)
             if bn in self.files:
@@ -446,10 +446,10 @@ class Xmp(fuse.Fuse):
         print('...done')
         #import pprint
         #pprint.pprint(self.by_tags)
-        self.XmpFile.files = self.files  # HACK
-        self.XmpFile.tagdirs = self.tagdirs  # HACK
-        self.XmpFile.by_tags = self.by_tags  # HACK
-        self.file_class = self.XmpFile
+        self.RPTagFSFile.files = self.files  # HACK
+        self.RPTagFSFile.tagdirs = self.tagdirs  # HACK
+        self.RPTagFSFile.by_tags = self.by_tags  # HACK
+        self.file_class = self.RPTagFSFile
         return fuse.Fuse.main(self, *a, **kw)
 
 
@@ -458,9 +458,9 @@ def main():
 Userspace nullfs-alike: mirror the filesystem tree from some point on.
 
 """ + fuse.Fuse.fusage
-    server = Xmp(version="%prog " + fuse.__version__,
-                 usage=usage,
-                 dash_s_do='setsingle')
+    server = RPTagFS(version="%prog " + fuse.__version__,
+                     usage=usage,
+                     dash_s_do='setsingle')
 
     server.parser.add_option(mountopt="root", metavar="PATH", default='/',
                              help="mirror filesystem from under PATH [default: %default]")
