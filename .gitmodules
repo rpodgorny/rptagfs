@@ -1,0 +1,3 @@
+[submodule "python-fuse"]
+	path = python-fuse
+	url = https://github.com/dlech/python-fuse
