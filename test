@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e -x
+
+rm -rf .coverage
+pipenv run python -m pytest test*py "$@"
+
+#pipenv run coverage run -m pytest test*py "$@"
+#pipenv run python -m pytest --profile test*py "$@"
+
+COVERAGE_REPORT_ARGS="--omit=*/python-fuse/*"
+rm -rf htmlcov
+pipenv run coverage html ${COVERAGE_REPORT_ARGS}
+pipenv run coverage report ${COVERAGE_REPORT_ARGS}
