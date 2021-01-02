@@ -13,4 +13,4 @@ coverage = "*"
 fb3cf0b = {editable = true,path = "./python-fuse"}
 
 [requires]
-python_version = "3.7"
+#python_version = "3.7"
