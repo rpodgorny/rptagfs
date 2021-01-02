@@ -16,9 +16,30 @@ import fuse
 #ROOT = '/home/radek/tmp/xxx'
 
 
+# rename situations:
+# /tag1/tag2/file1.txt -> /tag1/tag2/file2.txt - rename file1.txt
+# /tag1/tag2/file1.txt -> /tag2/tag1/file2.txt - rename file1.txt
+# /tag1/tag2/file1.txt -> /tag1/file1.txt - remove tag2 from file1.txt
+# /tag1/file1.txt -> /tag1/tag3/file1.txt - add tag3 to file1.txt
+# /tag1/tag2/file1.txt -> /tag2/tag1/file1.txt - do nothing
+# /tag1/tag2/file1.txt -> /tag1/tag3/file1.txt - remove tag2, add tag3 to file1.txt
+# /tag1/tag2/file1.txt -> /tag1/tag3/file2.txt - remove tag2, add tag3 from file1.txt and rename to file2.txt
+# /tag1/tag2 -> /tag1/tag3 - rename tag2 to tag3
+# /tag1/tag2 -> /tag3/tag2 - rename tag1 to tag3? (or maybe we should disallow?)
+# /tag1/tag2/tag3 -> /tag2/tag1/tag5 - rename tag3 to tag5? (or maybe we should disallow?)
+# /tag1/tag2 -> /tag1 - disallowed
+# /tag1/tag2 -> /tag3 - disallowed
+
+the_inst = None  # TODO: fucking global
+
+
+def tags_to_key(tags):
+    return tuple(sorted(tags))
+
+
 def path_to_tags(path):
     ret = set(os.path.dirname(path).split('/'))
-    ret -= set(['', ])
+    ret -= set([''])
     return ret
 
 
@@ -35,7 +56,7 @@ def find_free_bn(bn, existing_bns):
     root, ext = os.path.splitext(bn)
     i = 1
     while 1:
-        bn_ = '%s.%d%s' % (root, i, ext)
+        bn_ = '%s.__%d%s' % (root, i, ext)
         if bn_ not in existing_bns:
             return bn_
         i += 1
@@ -48,21 +69,19 @@ def make_files(path):
         if entry.is_dir():
             dirname = pth
             tags = path_to_tags(pth + '/')
-            tagdirs[tuple(tags)] = tagdirs.get(tuple(tags), set()) | set([dirname])
+            tagdirs[tags_to_key(tags)] = tagdirs.get(tags_to_key(tags), set()) | set([dirname])
             for tag in tags:
                 by_tags[tag] = by_tags.get(tag, set())
         elif entry.is_file():
             tags = path_to_tags(pth)
             bn = os.path.basename(pth)
-            #while bn in files:
-            #    bn = '%sx' % bn
             bn = find_free_bn(bn, set(files.keys()))
             files[bn] = {'ffn': pth, 'tags': tags}
             dirname = os.path.dirname(pth)
-            tagdirs[tuple(tags)] = tagdirs.get(tuple(tags), set()) | set([dirname])
+            tagdirs[tags_to_key(tags)] = tagdirs.get(tags_to_key(tags), set()) | set([dirname])
             for tag in tags:
                 by_tags[tag] = by_tags.get(tag, set()) | set([bn])
-    tagdirs[tuple(set(''))] = set(['/'])  # TODO: hack for directories with no files? fix!
+    #tagdirs[tags_to_key(set(['']))] = set(['/'])  # TODO: hack for directories with no files? fix!
     return files, tagdirs, by_tags
 
 
@@ -77,17 +96,17 @@ def get_avail_tags(tags, tagdirs):
     return ret
 
 
-# TODO: what about /path/tag1/tag1/tag2/...?
 def rename_tagdir_path(path, tag, tag_new):
-    path = path + '/'
-    path_new = path.replace('/%s/' % tag, '/%s/' % tag_new)
+    path_new = path + '/'
+    while '/%s/' % tag in path_new:
+        path_new = path_new.replace('/%s/' % tag, '/%s/' % tag_new, 1)
     path_new = path_new[:-1]
     return path_new
 
 
-# TODO: what about /path/tag1/tag1/tag2/...?
-def rename_tagdir(path, tag, tag_new):
-    subpath_pre, subpath_post = (path + '/').split('/%s/' % tag, 1)
+def rename_tagdir_right(path, tag, tag_new):
+    assert path.endswith('/%s' % tag)
+    subpath_pre, subpath_post = (path + '/').rsplit('/%s/' % tag, 1)
     print('RENNN', '.%s/%s' % (subpath_pre, tag), '.%s/%s' % (subpath_pre, tag_new))
     os.rename("." + '%s/%s' % (subpath_pre, tag), "." + '%s/%s' % (subpath_pre, tag_new))
     print('AFTER RENN')
@@ -126,27 +145,90 @@ class RPTagFS(fuse.Fuse):
 #            time.sleep(120)
 #            print "mythread: ticking"
 
+    # TODO: actually try to reuse as much of existing structure as possible
+    def _get_dir_for_tags(self, tags):
+        if tags_to_key(tags) in self.tagdirs:
+            return self.tagdirs[tags_to_key(tags)].copy().pop()  # TODO: invent some better rule than this randomness
+        path = '/' + '/'.join(tags)
+        os.makedirs("." + path)
+        #os.makedirs(self.root + path)
+        self.tagdirs[tags_to_key(tags)] = set([path])  # TODO: also add intermediate paths
+        return path
+
+    def _rename_file(self, fn, fn1):
+        ffn = self.files[fn].get('ffn')
+        tags = self.files[fn].get('tags', set())
+        ffn_new = ffn.replace('/%s' % fn, '/%s' % fn1)
+        assert not os.path.exists(ffn_new)
+        print('THE_RENAME2', ffn, ffn_new)
+        os.rename("." + ffn, "." + ffn_new)
+        self.files[fn]['ffn'] = ffn_new
+        self.files[fn1] = self.files.pop(fn)
+        for tag in tags:
+            self.by_tags[tag] = self.by_tags.get(tag, set()) - set([fn]) | set([fn1])
+
     def _rename_tag(self, tag, tag1):
         print('RENAME_TAG', tag, tag1)
-        self.by_tags[tag1] = self.by_tags[tag]
-        del self.by_tags[tag]
-        for i in self.by_tags[tag1]:
-            self.files[i]['ffn'] = rename_tagdir_path(self.files[i].get('ffn'), tag, tag1)
-            self.files[i]['tags'] = (self.files[i].get('tags', set()) - set([tag])) | set([tag1])
-        for k_, v in self.tagdirs.copy().items():
-            print('HUU', k_, v)
+        assert tag != tag1
+        assert tag1 not in self.by_tags  # new tag name must not exist
+        paths = set()
+        for k_, v in self.tagdirs.items():
             k = set(k_)
             if tag not in k:
                 continue
+            for pth in v:
+                paths.add(pth)
+        #for pth in paths.copy():
+        #    p = pth
+        #    while p:
+        #        paths.add(p)
+        #        p = pth.rsplit('/', 1)[0]
+        #paths = [i for i in paths if i.endswith('/' + tag)]
+        #paths = sorted(paths, key=lambda x: x.count('/'), reverse=True)
+        print('soustat', paths)
+        while paths:
+            longest = sorted(paths, key=lambda x: x.count('/'), reverse=True)[0]
+            bn = os.path.basename(longest)
+            if bn == tag:
+                rename_tagdir_right(longest, tag, tag1)
+            paths.remove(longest)
+            longest_new = longest[:-len('/%s' % bn)]
+            if longest_new:
+                paths.add(longest_new)
+        print('postsoustat', paths)
+        print('kokosojka', self.tagdirs)
+        for k_, v in self.tagdirs.copy().items():
+            k = set(k_)
             new_v = set()
             for pth in v:
-                if pth.endswith('/%s' % tag):
-                    rename_tagdir(pth, tag, tag1)
                 pth_new = rename_tagdir_path(pth, tag, tag1)
                 new_v.add(pth_new)
             del self.tagdirs[k_]
             new_k = (k - set([tag])) | set([tag1])
-            self.tagdirs[tuple(new_k)] = new_v
+            self.tagdirs[tags_to_key(new_k)] = new_v
+        print('postkokosojka', self.tagdirs)
+        self.by_tags[tag1] = self.by_tags[tag]
+        del self.by_tags[tag]
+        print('premrdka', self.by_tags)
+        for i in self.by_tags[tag1]:
+            self.files[i]['ffn'] = rename_tagdir_path(self.files[i].get('ffn'), tag, tag1)
+            self.files[i]['tags'] = (self.files[i].get('tags', set()) - set([tag])) | set([tag1])
+
+    def _add_remove_tags(self, bn, tags_to_add, tags_to_remove):
+        ffn = self.files[bn]['ffn']
+        bn_ = os.path.basename(ffn)
+        tags = self.files[bn].get('tags', set())
+        tags_new = (tags | tags_to_add) - tags_to_remove
+        ffn_new = '%s/%s' % (self._get_dir_for_tags(tags_new), bn_)
+        assert not os.path.exists(ffn_new)
+        print('THE_RENAME', ffn, ffn_new)
+        os.rename("." + ffn, "." + ffn_new)
+        self.files[bn]['ffn'] = ffn_new
+        self.files[bn]['tags'] = tags_new
+        for tag in tags_to_add:
+            self.by_tags[tag] = self.by_tags.get(tag, set()) | set([bn])
+        for tag in tags_to_remove:
+            self.by_tags[tag] = self.by_tags.get(tag, set()) - set([bn])
 
     def getattr(self, path):
         print('GETATTR', path)
@@ -158,7 +240,7 @@ class RPTagFS(fuse.Fuse):
         avail_tags = get_avail_tags(tags, self.tagdirs)
         if not bn or bn in avail_tags:
         #tags_ = path_to_tags(path + '/')
-        #if tuple(tags_) in self.tagdirs:
+        #if tags_to_key(tags_) in self.tagdirs:
         #if not bn or bn in self.by_tags:
             return os.lstat('.')
         return os.lstat('./NON_EXISTENT')
@@ -169,14 +251,17 @@ class RPTagFS(fuse.Fuse):
         return os.readlink("." + ffn)
 
     def readdir(self, path, offset):
+        print('READDIR', path)
         tags = path_to_tags(path + '/')
         avail_tags = get_avail_tags(tags, self.tagdirs)
+        print('readdir', tags, avail_tags)
         for i in avail_tags:
             yield fuse.Direntry(i)
         # TODO: the stuff below could be united but would it be fast?
         if not tags:
             fns = self.files.keys()
         else:
+            print('HUP', tags)
             fns = self.by_tags.get(tags.pop(), set())
             for tag in tags:
                 fns &= self.by_tags.get(tag, set())
@@ -194,9 +279,9 @@ class RPTagFS(fuse.Fuse):
 
     def rmdir(self, path):
         tags = path_to_tags(path + '/')
-        for i in self.tagdirs.get(tuple(tags), []):
+        for i in self.tagdirs.get(tags_to_key(tags), []):
             os.rmdir("." + i)
-        self.tagdirs.pop(tuple(tags), None)
+        self.tagdirs.pop(tags_to_key(tags), None)
         #bn = os.path.basename(path)
         #del self.by_tags[bn]
 
@@ -205,26 +290,37 @@ class RPTagFS(fuse.Fuse):
         pass
         #os.symlink(path, "." + path1)
 
-    def rename(self, path, path1):
+    def rename(self, path, path1):  # the simple (and limited) version - and unfinished?
         print('RENAME', path, path1)
         bn = os.path.basename(path)
         bn1 = os.path.basename(path1)
-        if bn in self.by_tags:
-            self._rename_tag(bn, bn1)
-            return
-        ffn = self.files[bn].get('ffn')
         tags = path_to_tags(path)
         tags1 = path_to_tags(path1)
         tags_to_add = tags1 - tags
         tags_to_remove = tags - tags1
+        if bn in self.by_tags:
+            #if tags or tags1:
+            #    return -errno.EOPNOTSUPP
+            assert bn1 not in self.by_tags
+            self._rename_tag(bn, bn1)
+            return
+        if bn in self.files:
+            if bn == bn1:
+                self._add_remove_tags(bn, tags_to_add, tags_to_remove)
+            else:
+                self._rename_file(bn, bn1)
+        return
+        # TODO: think of /tag1 -> /tag2/tag3/tag1 (something like "add_tags_to_tag")
+        # TODO: think of /tag2/tag3/tag1 -> /tag1 (something like "remove_tags_to_tag")
+        ffn = self.files[bn].get('ffn')
         tags1 = (self.files[bn].get('tags', set()) | tags_to_add) - tags_to_remove
-        if tuple(tags1) in self.tagdirs:
-            ffn1 = self.tagdirs[tuple(tags1)].copy().pop()
+        if tags_to_key(tags1) in self.tagdirs:
+            ffn1 = self.tagdirs[tags_to_key(tags1)].copy().pop()  # TODO: .copy().pop() - why?
         else:
             # TODO: this is not very nice - find a way to reuse as much of existing paths as possible
-            ffn1 = '/' + '/'.join(tuple(tags1))
+            ffn1 = '/' + '/'.join(tags_to_key(tags1))
             os.makedirs('.' + ffn1, exist_ok=True)
-            self.tagdirs[tuple(tags1)] = set([ffn1])
+            self.tagdirs[tags_to_key(tags1)] = set([ffn1])
         ffn1 = '%s/%s' % (ffn1, bn1)
         os.rename("." + ffn, "." + ffn1)
         del self.files[bn]
@@ -233,6 +329,84 @@ class RPTagFS(fuse.Fuse):
         self.files[bn1] = {'ffn': ffn1, 'tags': tags1}
         for tag in tags1:
             self.by_tags[tag].add(bn1)
+
+    # TODO: this one is broken
+    def rename____(self, path, path1):
+        print('RENAME', path, path1)
+        bn = os.path.basename(path)
+        if bn in self.by_tags:  # TODO: remove this limitation in the future
+            tags = path_to_tags(path)
+            tags1 = path_to_tags(path1)
+            if tags or tags1:
+                return -errno.EOPNOTSUPP
+            bn1 = os.path.basename(path1)
+            if bn == bn1:
+                return -errno.EOPNOTSUPP
+            return self._rename_tag(bn, bn1)
+        if bn in self.by_tags:  # TODO: this currently should not happen because of the test above
+            raise 'unexpected shit'
+            bn = bn1 = None
+            tags = path_to_tags(path + '/')
+            tags1 = path_to_tags(path1 + '/')
+        elif bn in self.files:
+            bn1 = os.path.basename(path1)
+            tags = path_to_tags(path)
+            tags1 = path_to_tags(path1)
+        else:
+            raise 'wtf?'
+        tags_to_add = tags1 - tags
+        tags_to_remove = tags - tags1
+        print('prcicky', bn, bn1, tags_to_add, tags_to_remove)
+        files_new = {}
+        for k, v in self.files.items():
+            print('juju', k, bn)
+            if bn is not None and k != bn:
+                continue
+            tags_ = v.get('tags', set())
+            print('jeje', tags_, tags_to_add, tags_to_remove)
+            #if not ((tags_to_add and tags_to_add.issubset(tags_)) or (tags_to_remove and tags_to_remove.issubset(tags_))):
+            #    continue
+            if (bn == bn1) \
+            and not (tags_to_remove & tags_) \
+            and not (tags_to_add - tags_):
+                continue
+            bn_ = os.path.basename(v['ffn'])
+            bn1_ = bn1 if bn1 else bn_
+            if bn != bn1:
+                existing_bns_ = set(self.files.keys()) - set([k])  # TODO: self.files.keys could be cached?
+                k_new = find_free_bn(bn1_, existing_bns_)
+            else:
+                k_new = k
+            tags_new = (v.get('tags', set()) | tags_to_add) - tags_to_remove
+            dirname_new = self._get_dir_for_tags(tags_new)
+            ffn_new = '%s/%s' % (dirname_new, bn1_)
+            assert not os.path.exists(ffn_new)
+            print('THE_RENAME', "." + v['ffn'], "." + ffn_new, k_new, tags_new)
+            os.rename("." + v['ffn'], "." + ffn_new)
+            files_new[k_new] = {'ffn': ffn_new, 'tags': tags_new}
+            for tag in v.get('tags', set()):
+                self.by_tags[tag] = self.by_tags.get(tag, set()) - set([k])
+            for tag in tags_new:
+                self.by_tags[tag] = self.by_tags.get(tag, set()) | set([k_new])
+        self.files = files_new
+        ##dirname_new = self._get_dir_for_tags(tags_new)
+        tags_to_annihilate = set()
+        for k, v in self.by_tags.items():
+            if not v and k in tags_to_remove:
+                tags_to_annihilate.add(k)
+        print('tags_to_annihilate', tags_to_annihilate)
+        dirs_to_annihilate = set()
+        for k, v in self.tagdirs.copy().items():
+            if set(k).intersection(tags_to_annihilate):
+                dirs_to_annihilate |= v
+                del self.tagdirs[k]
+        for tag in tags_to_annihilate:
+            del self.by_tags[tag]
+        for i in sorted(dirs_to_annihilate, reverse=True):
+            print('THE_RMDIR', i)
+            os.rmdir("." + i)
+        print('by_tags', self.by_tags)
+        print('tagdirs', self.tagdirs)
 
     def link(self, path, path1):
         # TODO
@@ -265,11 +439,12 @@ class RPTagFS(fuse.Fuse):
         print('MKDIR', path)
         bn = os.path.basename(path)
         tags = path_to_tags(path)
-        pth = self.tagdirs[tuple(tags)].copy().pop()
+        pth = self.tagdirs[tags_to_key(tags)].copy().pop()  # TODO: i don't like this random pick
         pth = '%s/%s' % (pth, bn)
         os.mkdir("." + pth, mode)
         tags = tags | set([bn])
-        self.tagdirs[tuple(tags)] = set([pth])
+        self.tagdirs[tags_to_key(tags)] = set([pth])
+        print('tagdirs', self.tagdirs)
         self.by_tags[bn] = self.by_tags.get(bn, set())
         print('by_tags', self.by_tags)
 
@@ -296,7 +471,7 @@ class RPTagFS(fuse.Fuse):
             return None
             #return os.access('.' + ffn, mode)
         tags = path_to_tags(path + '/')
-        if tuple(tags) in self.tagdirs:
+        if tags_to_key(tags) in self.tagdirs:
             return None
         return -errno.EACCES
         #if not os.access("." + path, mode):
@@ -347,19 +522,25 @@ class RPTagFS(fuse.Fuse):
 
     class RPTagFSFile(object):
         def __init__(self, path, flags, *mode):
+            print('FILE', path, flags, mode, flag2mode(flags))
             bn = os.path.basename(path)
-            if bn in self.files:
-                ffn = self.files[bn].get('ffn')
+            if bn in the_inst.files:
+                tags = path_to_tags(path)
+                if not tags.issubset(the_inst.files[bn].get('tags', set())):
+                    raise 'invalid tags'
+                ffn = the_inst.files[bn].get('ffn')
             else:
                 tags = path_to_tags(path)
                 # TODO: this is not very nice - find a way to reuse as much of existing paths as possible
-                ffn = '/' + '/'.join(tuple(tags))
-                os.makedirs('.' + ffn, exist_ok=True)
-                self.tagdirs[tuple(tags)] = set([ffn])
-                ffn = '%s/%s' % (ffn, bn)
-                self.files[bn] = {'ffn': ffn, 'tags': tags}
+                #ffn = '/' + '/'.join(tags_to_key(tags))
+                #os.makedirs('.' + ffn, exist_ok=True)
+                #the_inst.tagdirs[tags_to_key(tags)] = set([ffn])
+                #ffn = '%s/%s' % (ffn, bn)
+                dir_ = the_inst._get_dir_for_tags(tags)
+                ffn = '%s/%s' % (dir_, bn)
+                the_inst.files[bn] = {'ffn': ffn, 'tags': tags}
                 for tag in tags:
-                    self.by_tags[tag].add(bn)
+                    the_inst.by_tags[tag].add(bn)
             self.file = os.fdopen(os.open("." + ffn, flags, *mode), flag2mode(flags))
             self.fd = self.file.fileno()
 
@@ -437,7 +618,7 @@ class RPTagFS(fuse.Fuse):
                 return -errno.EINVAL
             fcntl.lockf(self.fd, op, kw['l_start'], kw['l_len'])
 
-    def main(self, *a, **kw):
+    def init(self):
         print('loading files from %s...' % self.root)
         self.files, self.tagdirs, self.by_tags = make_files(self.root)
         print('files', self.files)
@@ -446,10 +627,15 @@ class RPTagFS(fuse.Fuse):
         print('...done')
         #import pprint
         #pprint.pprint(self.by_tags)
-        self.RPTagFSFile.files = self.files  # HACK
-        self.RPTagFSFile.tagdirs = self.tagdirs  # HACK
-        self.RPTagFSFile.by_tags = self.by_tags  # HACK
+        #self.RPTagFSFile.files = self.files  # HACK
+        #self.RPTagFSFile.tagdirs = self.tagdirs  # HACK
+        #self.RPTagFSFile.by_tags = self.by_tags  # HACK
         self.file_class = self.RPTagFSFile
+        global the_inst
+        the_inst = self
+
+    def main(self, *a, **kw):
+        self.init()
         return fuse.Fuse.main(self, *a, **kw)
 
 
