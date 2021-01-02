@@ -38,9 +38,7 @@ def tags_to_key(tags):
 
 
 def path_to_tags(path):
-    ret = set(os.path.dirname(path).split('/'))
-    ret -= set([''])
-    return ret
+    return set(os.path.dirname(path).split('/')) - set([''])
 
 
 def scantree(path):
@@ -251,7 +249,7 @@ class RPTagFS(fuse.Fuse):
         return os.readlink("." + ffn)
 
     def readdir(self, path, offset):
-        print('READDIR', path)
+        print('READDIR', path, offset)
         tags = path_to_tags(path + '/')
         avail_tags = get_avail_tags(tags, self.tagdirs)
         print('readdir', tags, avail_tags)
@@ -262,11 +260,14 @@ class RPTagFS(fuse.Fuse):
             fns = self.files.keys()
         else:
             print('HUP', tags)
-            fns = self.by_tags.get(tags.pop(), set())
+            fns = self.by_tags.get(tags.pop(), set()).copy()
+            print('HUPF', len(fns))
             for tag in tags:
+                print('SUBHUP', tag)
                 fns &= self.by_tags.get(tag, set())
         for fn in fns:
             yield fuse.Direntry(fn)
+        print('READDIR DONE', path, offset)
 
     def unlink(self, path):
         bn = os.path.basename(path)
@@ -436,6 +437,11 @@ class RPTagFS(fuse.Fuse):
         os.mknod("." + ffn, mode, dev)
 
     def mkdir(self, path, mode):
+        print('MKDIR', path, mode)
+        tags = path_to_tags(path + "/")
+        pth = self._get_dir_for_tags(tags)
+
+    def mkdir__(self, path, mode):
         print('MKDIR', path)
         bn = os.path.basename(path)
         tags = path_to_tags(path)
