@@ -152,7 +152,7 @@ class RPTagFS(fuse.Fuse):
         #os.makedirs(self.root + path)
         self.tagdirs[tags_to_key(tags)] = set([path])  # TODO: also add intermediate paths
         for tag in tags:
-            self.by_tags[tag] = self.by_tags.get(tag, set()) | set()
+            self.by_tags[tag] = self.by_tags.get(tag, set())
         return path
 
     def _rename_file(self, fn, fn1):
