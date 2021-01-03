@@ -209,24 +209,26 @@ class RPTagFS(fuse.Fuse):
         del self.by_tags[tag]
         print('premrdka', self.by_tags)
         for i in self.by_tags[tag1]:
-            self.files[i]['ffn'] = rename_tagdir_path(self.files[i].get('ffn'), tag, tag1)
-            self.files[i]['tags'] = (self.files[i].get('tags', set()) - set([tag])) | set([tag1])
+            self.files[i] = {
+                'ffn': rename_tagdir_path(self.files[i].get('ffn'), tag, tag1),
+                'tags': (self.files[i].get('tags', set()) - set([tag])) | set([tag1]),
+            }
 
-    def _add_remove_tags(self, bn, tags_to_add, tags_to_remove):
-        ffn = self.files[bn]['ffn']
-        bn_ = os.path.basename(ffn)
-        tags = self.files[bn].get('tags', set())
+    def _add_remove_tags(self, fn, tags_to_add, tags_to_remove):
+        ffn = self.files[fn]['ffn']
+        bn = os.path.basename(ffn)
+        tags = self.files[fn].get('tags', set())
         tags_new = (tags | tags_to_add) - tags_to_remove
-        ffn_new = '%s/%s' % (self._get_dir_for_tags(tags_new), bn_)
+        ffn_new = '%s/%s' % (self._get_dir_for_tags(tags_new), bn)
         assert not os.path.exists(ffn_new)
         print('THE_RENAME', ffn, ffn_new)
         os.rename("." + ffn, "." + ffn_new)
-        self.files[bn]['ffn'] = ffn_new
-        self.files[bn]['tags'] = tags_new
+        self.files[fn]['ffn'] = ffn_new
+        self.files[fn]['tags'] = tags_new
         for tag in tags_to_add:
-            self.by_tags[tag] = self.by_tags.get(tag, set()) | set([bn])
+            self.by_tags[tag] = self.by_tags.get(tag, set()) | set([fn])
         for tag in tags_to_remove:
-            self.by_tags[tag] = self.by_tags.get(tag, set()) - set([bn])
+            self.by_tags[tag] = self.by_tags.get(tag, set()) - set([fn])
 
     def getattr(self, path):
         print('GETATTR', path)
@@ -274,13 +276,13 @@ class RPTagFS(fuse.Fuse):
         ffn = self.files[bn].get('ffn')
         tags = self.files[bn].get('tags')
         for tag in tags:
-            self.by_tags[tag] -= set([bn, ])
+            self.by_tags[tag] -= set([bn])
         del self.files[bn]
         os.unlink("." + ffn)
 
     def rmdir(self, path):
         tags = path_to_tags(path + '/')
-        for i in self.tagdirs.get(tags_to_key(tags), []):
+        for i in self.tagdirs.get(tags_to_key(tags), set()):
             os.rmdir("." + i)
         self.tagdirs.pop(tags_to_key(tags), None)
         #bn = os.path.basename(path)
