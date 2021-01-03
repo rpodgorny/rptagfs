@@ -291,7 +291,7 @@ class RPTagFS(fuse.Fuse):
         pass
         #os.symlink(path, "." + path1)
 
-    def rename(self, path, path1):  # the simple (and limited) version - and unfinished?
+    def rename(self, path, path1):
         print('RENAME', path, path1)
         bn = os.path.basename(path)
         bn1 = os.path.basename(path1)
@@ -310,7 +310,8 @@ class RPTagFS(fuse.Fuse):
                 self._add_remove_tags(bn, tags_to_add, tags_to_remove)
             else:
                 self._rename_file(bn, bn1)
-        return
+            return
+        raise 'wut?'
         # TODO: think of /tag1 -> /tag2/tag3/tag1 (something like "add_tags_to_tag")
         # TODO: think of /tag2/tag3/tag1 -> /tag1 (something like "remove_tags_to_tag")
         ffn = self.files[bn].get('ffn')
