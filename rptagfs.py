@@ -146,11 +146,13 @@ class RPTagFS(fuse.Fuse):
     # TODO: actually try to reuse as much of existing structure as possible
     def _get_dir_for_tags(self, tags):
         if tags_to_key(tags) in self.tagdirs:
-            return self.tagdirs[tags_to_key(tags)].copy().pop()  # TODO: invent some better rule than this randomness
-        path = '/' + '/'.join(tags)
+            return sorted(self.tagdirs[tags_to_key(tags)])[0]  # TODO: invent some better rule than this randomness
+        path = '/' + '/'.join(sorted(tags))  # TODO: try to reuse existing paths
         os.makedirs("." + path)
         #os.makedirs(self.root + path)
         self.tagdirs[tags_to_key(tags)] = set([path])  # TODO: also add intermediate paths
+        for tag in tags:
+            self.by_tags[tag] = self.by_tags.get(tag, set()) | set()
         return path
 
     def _rename_file(self, fn, fn1):
@@ -443,6 +445,7 @@ class RPTagFS(fuse.Fuse):
         print('MKDIR', path, mode)
         tags = path_to_tags(path + "/")
         pth = self._get_dir_for_tags(tags)
+        print('PTH', pth)
 
     def mkdir__(self, path, mode):
         print('MKDIR', path)
