@@ -38,15 +38,20 @@ layout:
 
 ### Example
 
-Source directory:
+Source directory — note that `rock` appears under both `music` and `photos`,
+so it becomes a tag shared across a track and a photo:
 
 ```
 src/
 ├── music/
-│   └── rock/
-│       └── song.mp3
+│   ├── rock/
+│   │   └── thunder.mp3
+│   └── jazz/
+│       └── smooth.mp3
 ├── photos/
-│   └── pic.jpg
+│   ├── rock/
+│   │   └── concert.jpg
+│   └── beach.jpg
 └── readme.txt
 ```
 
@@ -55,22 +60,44 @@ Mounted view:
 ```
 mnt/
 ├── _all/
-│   ├── song.mp3
-│   ├── pic.jpg
+│   ├── thunder.mp3
+│   ├── smooth.mp3
+│   ├── concert.jpg
+│   ├── beach.jpg
 │   └── readme.txt
 ├── _untagged/
 │   └── readme.txt
+├── jazz/
+│   └── smooth.mp3
 ├── music/
+│   ├── jazz/
+│   │   └── smooth.mp3
 │   ├── rock/
-│   │   └── song.mp3
-│   └── song.mp3
-└── photos/
-    └── pic.jpg
+│   │   └── thunder.mp3
+│   ├── smooth.mp3
+│   └── thunder.mp3
+├── photos/
+│   ├── rock/
+│   │   └── concert.jpg
+│   ├── beach.jpg
+│   └── concert.jpg
+└── rock/                    # shared by music AND photos
+    ├── music/
+    │   └── thunder.mp3
+    ├── photos/
+    │   └── concert.jpg
+    ├── concert.jpg
+    └── thunder.mp3
 ```
 
+Because `rock` is a tag in its own right, `rock/` collects both `thunder.mp3`
+and `concert.jpg`. Drilling further intersects tags: `rock/music/` narrows to
+just `thunder.mp3`, and `music/rock/` is the same set reached the other way
+around.
+
 When two files in different directories share a name, the second one gets a
-`.__N` suffix inserted before its extension (`song.mp3` → `song.__1.mp3`) so
-every file has a unique name in the flat views.
+`.__N` suffix inserted before its extension (e.g. `thunder.mp3` →
+`thunder.__1.mp3`) so every file has a unique name in the flat views.
 
 ## Build
 
