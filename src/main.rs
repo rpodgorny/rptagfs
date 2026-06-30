@@ -8,7 +8,7 @@ mod scanner;
 mod tagfs;
 
 #[derive(Parser)]
-#[command(name = "rptagfs-rs", about = "Tag-based virtual filesystem")]
+#[command(name = "rptagfs", about = "Tag-based virtual filesystem")]
 struct Args {
     /// Source directory to mirror
     source_dir: PathBuf,
