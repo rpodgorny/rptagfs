@@ -4,8 +4,7 @@ A tag-based virtual filesystem. `rptagfs` mounts a FUSE filesystem that
 re-presents a plain source directory as a navigable tree of **tags**, where
 each directory level in the source becomes a tag on the files it contains.
 
-This is a Rust reimplementation (using [`fuse3`](https://crates.io/crates/fuse3))
-of an earlier Python version.
+Built on [`fuse3`](https://crates.io/crates/fuse3).
 
 ## Concept
 
