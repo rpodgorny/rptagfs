@@ -482,6 +482,10 @@ impl FsState {
     }
 }
 
+/// A directory's entries, plus the physical paths still to be stat'ed given
+/// as (index into entries, path).
+type DirPlan = (Vec<SnapEntry>, Vec<(usize, PathBuf)>);
+
 /// One directory entry, held in an open directory's snapshot.
 /// Carries the attributes too, so readdirplus needs no further stat.
 struct SnapEntry {
@@ -560,7 +564,7 @@ impl TagFs {
         &self,
         inode: u64,
         state: &mut FsState,
-    ) -> FuseResult<(Vec<SnapEntry>, Vec<(usize, PathBuf)>)> {
+    ) -> FuseResult<DirPlan> {
         let inode_entry = state.inode_table.get(inode).cloned();
         let mut entries = Vec::new();
         let mut pending = Vec::new();
