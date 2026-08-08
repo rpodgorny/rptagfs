@@ -1649,6 +1649,82 @@ mod tests {
         scan_to_state(dir.path())
     }
 
+    // --- paged readdir ---
+
+    /// Read a directory the way the kernel does: repeated calls, each one
+    /// continuing from the offset of the last entry of the previous batch.
+    /// A small page size forces many rounds, which is what exposes an
+    /// entry order that is not stable across calls.
+    async fn readdir_paged(fs: &TagFs, inode: u64, page: usize) -> Vec<String> {
+        use futures_util::StreamExt;
+
+        let req = Request { unique: 0, uid: 0, gid: 0, pid: 0 };
+        let mut names = Vec::new();
+        let mut offset: i64 = 0;
+        // Bound the loop so a paging bug fails the assert rather than hanging.
+        for _ in 0..1000 {
+            let reply = fs.readdir(req, inode, 0, offset).await.unwrap();
+            let batch: Vec<DirectoryEntry> = reply
+                .entries
+                .take(page)
+                .map(|e| e.unwrap())
+                .collect()
+                .await;
+            let Some(last) = batch.last() else { return names };
+            offset = last.offset;
+            names.extend(batch.iter().map(|e| e.name.to_string_lossy().to_string()));
+        }
+        panic!("readdir did not terminate");
+    }
+
+    /// 60 files, read 7 at a time. Before the fix each call rebuilt the entry
+    /// list from a fresh HashSet with its own hash seed, so every page was cut
+    /// out of a differently ordered list: entries were skipped and repeated.
+    #[tokio::test]
+    async fn readdir_paging_returns_every_entry_exactly_once() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("music")).unwrap();
+        let expected: BTreeSet<String> = (0..60)
+            .map(|i| {
+                let name = format!("track{i:02}.mp3");
+                fs::write(dir.path().join("music").join(&name), "x").unwrap();
+                name
+            })
+            .collect();
+
+        let scan = crate::scanner::scan_tree(dir.path(), false);
+        let fs = TagFs::new(dir.path().to_path_buf(), scan);
+        let music_ino = fs
+            .state
+            .write()
+            .unwrap()
+            .inode_table
+            .get_or_alloc_dir(&BTreeSet::from(["music".to_string()]));
+
+        for (label, ino) in [("music", music_ino), ("_all", ALL_INODE)] {
+            let names = readdir_paged(&fs, ino, 7).await;
+            let files: Vec<&String> = names.iter().filter(|n| n.ends_with(".mp3")).collect();
+            let unique: BTreeSet<String> = files.iter().map(|n| (*n).clone()).collect();
+            assert_eq!(unique, expected, "{label}: wrong set of files");
+            assert_eq!(files.len(), expected.len(), "{label}: duplicated entries");
+            assert_eq!(&names[..2], &[".".to_string(), "..".to_string()]);
+        }
+    }
+
+    /// Entry order must not depend on the hash seed of a freshly built set.
+    #[tokio::test]
+    async fn readdir_order_is_stable_across_calls() {
+        let dir = tempdir().unwrap();
+        write_test_layout(dir.path());
+        let scan = crate::scanner::scan_tree(dir.path(), false);
+        let fs = TagFs::new(dir.path().to_path_buf(), scan);
+
+        let first = readdir_paged(&fs, ALL_INODE, 100).await;
+        for _ in 0..5 {
+            assert_eq!(readdir_paged(&fs, ALL_INODE, 100).await, first);
+        }
+    }
+
     // --- get_avail_tags tests ---
 
     #[test]
