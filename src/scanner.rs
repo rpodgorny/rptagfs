@@ -54,15 +54,19 @@ fn split_ext(name: &str) -> (&str, &str) {
 
 /// Resolve basename collision by appending .__N before extension.
 /// "file.txt" with existing "file.txt" -> "file.__1.txt"
-pub fn find_free_bn(bn: &str, existing: &HashSet<String>) -> String {
-    if !existing.contains(bn) {
+///
+/// Takes a predicate rather than a set so callers can query whatever they
+/// already have. Materializing the taken names here would be O(files) per
+/// call, and the scanner calls this once per file.
+pub fn find_free_bn(bn: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(bn) {
         return bn.to_string();
     }
     let (root, ext) = split_ext(bn);
     let mut i = 1u32;
     loop {
         let candidate = format!("{}.__{}{}", root, i, ext);
-        if !existing.contains(&candidate) {
+        if !taken(&candidate) {
             return candidate;
         }
         i += 1;
@@ -129,8 +133,7 @@ fn scan_dir(root: &Path, rel_dir: &Path, show_hidden: bool, result: &mut ScanRes
         } else if metadata.is_file() {
             let tags = file_path_to_tags(&rel_path);
             let original_bn = name_str.to_string();
-            let existing_keys: HashSet<String> = result.files.keys().cloned().collect();
-            let bn = find_free_bn(&original_bn, &existing_keys);
+            let bn = find_free_bn(&original_bn, |n| result.files.contains_key(n));
             if bn != original_bn {
                 log::debug!("Collision resolved: {:?} -> {:?}", original_bn, bn);
             }
@@ -277,33 +280,33 @@ mod tests {
 
     #[test]
     fn find_free_bn_no_collision() {
-        let existing = HashSet::new();
-        assert_eq!(find_free_bn("file.txt", &existing), "file.txt");
+        let existing: HashSet<String> = HashSet::new();
+        assert_eq!(find_free_bn("file.txt", |n| existing.contains(n)), "file.txt");
     }
 
     #[test]
     fn find_free_bn_one_collision() {
-        let existing = HashSet::from(["file.txt".into()]);
-        assert_eq!(find_free_bn("file.txt", &existing), "file.__1.txt");
+        let existing: HashSet<String> = HashSet::from(["file.txt".into()]);
+        assert_eq!(find_free_bn("file.txt", |n| existing.contains(n)), "file.__1.txt");
     }
 
     #[test]
     fn find_free_bn_multi_collision() {
-        let existing = HashSet::from(["file.txt".into(), "file.__1.txt".into()]);
-        assert_eq!(find_free_bn("file.txt", &existing), "file.__2.txt");
+        let existing: HashSet<String> = HashSet::from(["file.txt".into(), "file.__1.txt".into()]);
+        assert_eq!(find_free_bn("file.txt", |n| existing.contains(n)), "file.__2.txt");
     }
 
     #[test]
     fn find_free_bn_no_ext() {
-        let existing = HashSet::from(["README".into()]);
-        assert_eq!(find_free_bn("README", &existing), "README.__1");
+        let existing: HashSet<String> = HashSet::from(["README".into()]);
+        assert_eq!(find_free_bn("README", |n| existing.contains(n)), "README.__1");
     }
 
     #[test]
     fn find_free_bn_double_ext() {
-        let existing = HashSet::from(["archive.tar.gz".into()]);
+        let existing: HashSet<String> = HashSet::from(["archive.tar.gz".into()]);
         assert_eq!(
-            find_free_bn("archive.tar.gz", &existing),
+            find_free_bn("archive.tar.gz", |n| existing.contains(n)),
             "archive.tar.__1.gz"
         );
     }
@@ -633,14 +636,14 @@ mod tests {
     fn find_free_bn_hidden_file_collision() {
         // ".hidden" → split_ext returns (".hidden", "") since rfind('.') pos=0 fails pos > 0
         let existing = HashSet::from([".hidden".to_string()]);
-        assert_eq!(find_free_bn(".hidden", &existing), ".hidden.__1");
+        assert_eq!(find_free_bn(".hidden", |n| existing.contains(n)), ".hidden.__1");
     }
 
     #[test]
     fn find_free_bn_dot_only() {
         // "." → split_ext returns (".", "") — degenerate but shouldn't panic
         let existing = HashSet::from([".".to_string()]);
-        assert_eq!(find_free_bn(".", &existing), "..__1");
+        assert_eq!(find_free_bn(".", |n| existing.contains(n)), "..__1");
     }
 
     #[test]
@@ -652,12 +655,12 @@ mod tests {
     #[test]
     fn find_free_bn_gap_in_sequence() {
         // Existing has a gap: 1 and 3 present but not 2. Should find 2 first.
-        let existing = HashSet::from([
+        let existing: HashSet<String> = HashSet::from([
             "f.txt".to_string(),
             "f.__1.txt".to_string(),
             "f.__3.txt".to_string(),
         ]);
-        assert_eq!(find_free_bn("f.txt", &existing), "f.__2.txt");
+        assert_eq!(find_free_bn("f.txt", |n| existing.contains(n)), "f.__2.txt");
     }
 
     #[test]

@@ -109,6 +109,22 @@ impl InodeTable {
     }
 }
 
+/// Names in a stable order, for emitting directory entries.
+///
+/// readdir is paged: the kernel calls it repeatedly with a growing offset and
+/// each call rebuilds the whole entry list, so the order must be identical
+/// every time or a page boundary lands in a different place than the previous
+/// call assumed. HashSet iteration order is not identical - every HashSet gets
+/// its own hash seed, so a freshly built one iterates differently. That
+/// silently dropped and duplicated entries on directories big enough to page
+/// (~14k of 40k files missing, ~10k repeated). Tag entries come from a
+/// BTreeSet and are already ordered; only file names need this.
+fn sorted_names(names: &HashSet<String>) -> Vec<&String> {
+    let mut v: Vec<&String> = names.iter().collect();
+    v.sort_unstable();
+    v
+}
+
 /// All mutable filesystem state, protected by a single RwLock.
 struct FsState {
     files: HashMap<String, FileEntry>,
@@ -850,8 +866,9 @@ impl Filesystem for TagFs {
                 // Non-root: also emit matching files
                 if !is_root {
                     let matching_files = state.get_matching_files(tags);
+                    let names = sorted_names(&matching_files);
                     let root = self.root.clone();
-                    for basename in &matching_files {
+                    for basename in names {
                         if avail_tags.contains(basename) {
                             continue;
                         }
@@ -872,7 +889,7 @@ impl Filesystem for TagFs {
                     SpecialKind::Untagged => state.get_untagged_files(),
                 };
                 let root = self.root.clone();
-                for basename in &file_set {
+                for basename in sorted_names(&file_set) {
                     let file_ino = state.inode_table.get_or_alloc_file(basename);
                     entries.push(Ok(DirectoryEntry {
                         inode: file_ino,
@@ -997,7 +1014,7 @@ impl Filesystem for TagFs {
                 // Non-root: also emit matching files
                 if !is_root {
                     let matching_files = state.get_matching_files(tags);
-                    for basename in &matching_files {
+                    for basename in sorted_names(&matching_files) {
                         if avail_tags.contains(basename) {
                             continue;
                         }
@@ -1025,7 +1042,7 @@ impl Filesystem for TagFs {
                     SpecialKind::All => state.get_matching_files(&BTreeSet::new()),
                     SpecialKind::Untagged => state.get_untagged_files(),
                 };
-                for basename in &file_set {
+                for basename in sorted_names(&file_set) {
                     let file_ino = state.inode_table.get_or_alloc_file(basename);
                     let attr = match self.file_attr(file_ino, basename, &state) {
                         Ok(a) => a,
