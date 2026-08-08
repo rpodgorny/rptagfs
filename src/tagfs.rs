@@ -589,17 +589,44 @@ impl TagFs {
         Ok(entries)
     }
 
-    /// Append one file entry, skipping it if the physical file cannot be stat'ed.
+    /// Append one file entry.
+    ///
+    /// A file we know about but cannot stat - deleted or made unreachable
+    /// behind our back - is still listed, with placeholder attributes. We know
+    /// the name is there, so hiding it would turn a source problem into a
+    /// silently short listing. Opening it will fail with the real error.
     fn push_file_entry(&self, entries: &mut Vec<SnapEntry>, basename: &str, state: &mut FsState) {
         let ino = state.inode_table.get_or_alloc_file(basename);
-        match self.file_attr(ino, basename, state) {
-            Ok(attr) => entries.push(SnapEntry {
-                inode: ino,
-                kind: attr.kind,
-                name: OsString::from(basename),
-                attr,
-            }),
-            Err(_) => log::debug!("readdir: skipping unstattable {:?}", basename),
+        let attr = self.file_attr(ino, basename, state).unwrap_or_else(|e| {
+            log::debug!("readdir: cannot stat {:?}: {:?}, listing as placeholder", basename, e);
+            self.placeholder_file_attr(ino)
+        });
+        entries.push(SnapEntry {
+            inode: ino,
+            kind: attr.kind,
+            name: OsString::from(basename),
+            attr,
+        });
+    }
+
+    /// Attributes for a file that could not be stat'ed. Zero size and epoch
+    /// times for the same reason tag directories use them: report nothing
+    /// rather than invent something plausible.
+    fn placeholder_file_attr(&self, ino: u64) -> FileAttr {
+        FileAttr {
+            ino,
+            size: 0,
+            blocks: 0,
+            atime: UNIX_EPOCH.into(),
+            mtime: UNIX_EPOCH.into(),
+            ctime: UNIX_EPOCH.into(),
+            kind: FileType::RegularFile,
+            perm: 0o644,
+            nlink: 1,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            rdev: 0,
+            blksize: 4096,
         }
     }
 
@@ -3268,10 +3295,11 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// A file deleted behind our back cannot be stat'ed, so it is left out of
-    /// the listing rather than reported with guessed attributes.
+    /// A file deleted behind our back is still listed, with placeholder
+    /// attributes: we know the name is there, and dropping it would make the
+    /// listing silently short.
     #[tokio::test]
-    async fn external_delete_omits_file_from_listing() {
+    async fn external_delete_still_lists_file() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let tagfs = make_test_tagfs(&root);
@@ -3282,15 +3310,12 @@ mod tests {
             .inode_table
             .get_or_alloc_dir(&BTreeSet::from(["music".to_string()]));
 
-        assert!(readdir_paged(&tagfs, music_ino, 100)
-            .await
-            .contains(&"song.mp3".to_string()));
-
         fs::remove_file(root.join("music/song.mp3")).unwrap();
 
-        assert!(!readdir_paged(&tagfs, music_ino, 100)
-            .await
-            .contains(&"song.mp3".to_string()));
+        let entries = readdir_entries(&tagfs, music_ino).await;
+        let song = entries.iter().find(|e| e.name == "song.mp3");
+        assert!(song.is_some(), "deleted file dropped from listing");
+        assert_eq!(song.unwrap().kind, FileType::RegularFile);
     }
 
     #[test]
