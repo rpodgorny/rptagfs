@@ -58,23 +58,36 @@ fn split_ext(name: &str) -> (&str, &str) {
 /// Takes a predicate rather than a set so callers can query whatever they
 /// already have. Materializing the taken names here would be O(files) per
 /// call, and the scanner calls this once per file.
-pub fn find_free_bn(bn: &str, taken: impl Fn(&str) -> bool) -> String {
+/// Probing starts at `start`, and the next index to try comes back with the
+/// name. Always probing from 1 makes the k-th file sharing a basename cost k
+/// lookups, so a tree where many directories hold the same filename - covers,
+/// posters, track numbers - takes quadratic time to scan. A caller that feeds
+/// the returned index back in gets amortized constant time.
+pub fn find_free_bn(bn: &str, start: u32, taken: impl Fn(&str) -> bool) -> (String, u32) {
     if !taken(bn) {
-        return bn.to_string();
+        return (bn.to_string(), start);
     }
     let (root, ext) = split_ext(bn);
-    let mut i = 1u32;
+    let mut i = start;
     loop {
         let candidate = format!("{}.__{}{}", root, i, ext);
-        if !taken(&candidate) {
-            return candidate;
-        }
         i += 1;
+        if !taken(&candidate) {
+            return (candidate, i);
+        }
     }
 }
 
 /// Recursively scan a directory, populating the ScanResult.
-fn scan_dir(root: &Path, rel_dir: &Path, show_hidden: bool, result: &mut ScanResult) {
+fn scan_dir(
+    root: &Path,
+    rel_dir: &Path,
+    show_hidden: bool,
+    result: &mut ScanResult,
+    // basename -> next .__N index to try, so repeated collisions of the same
+    // name do not rescan the run of suffixes already handed out
+    next_suffix: &mut HashMap<String, u32>,
+) {
     let full_path = root.join(rel_dir);
     log::debug!("Entering directory: {:?}", full_path);
     let entries = match fs::read_dir(&full_path) {
@@ -99,21 +112,38 @@ fn scan_dir(root: &Path, rel_dir: &Path, show_hidden: bool, result: &mut ScanRes
             rel_dir.join(&name)
         };
 
-        // Follow symlinks for type classification (like Python's entry.is_dir()/is_file())
-        let metadata = match fs::metadata(root.join(&rel_path)) {
-            Ok(m) => m,
-            Err(_) => {
-                log::debug!("Skipping broken symlink: {:?}", rel_path);
-                continue;
-            }
+        // read_dir already knows the entry's own type on Linux - it comes back
+        // in the directory block - so this costs no syscall. Only a symlink
+        // needs resolving to find out what it points at, which is what the two
+        // unconditional stats per entry here used to be for.
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => match fs::symlink_metadata(root.join(&rel_path)) {
+                Ok(m) => m.file_type(),
+                Err(_) => {
+                    log::debug!("Cannot type {:?}, skipping", rel_path);
+                    continue;
+                }
+            },
         };
 
-        // Check real type (without following symlinks) for recursion decision
-        let is_real_dir = fs::symlink_metadata(root.join(&rel_path))
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
+        // Only recurse into real directories, never through a symlink
+        let is_real_dir = file_type.is_dir();
 
-        if metadata.is_dir() {
+        // Classify following symlinks, like Python's entry.is_dir()/is_file()
+        let (is_dir, is_file) = if file_type.is_symlink() {
+            match fs::metadata(root.join(&rel_path)) {
+                Ok(m) => (m.is_dir(), m.is_file()),
+                Err(_) => {
+                    log::debug!("Skipping broken symlink: {:?}", rel_path);
+                    continue;
+                }
+            }
+        } else {
+            (file_type.is_dir(), file_type.is_file())
+        };
+
+        if is_dir {
             let tags = dir_path_to_tags(&rel_path);
             log::debug!("Directory: {:?}, tags: {:?}", rel_path, tags);
             result
@@ -126,14 +156,17 @@ fn scan_dir(root: &Path, rel_dir: &Path, show_hidden: bool, result: &mut ScanRes
             }
             // Only recurse into real directories, not symlinks (avoids infinite loops)
             if is_real_dir {
-                scan_dir(root, &rel_path, show_hidden, result);
+                scan_dir(root, &rel_path, show_hidden, result, next_suffix);
             } else {
                 log::debug!("Not recursing into symlinked directory: {:?}", rel_path);
             }
-        } else if metadata.is_file() {
+        } else if is_file {
             let tags = file_path_to_tags(&rel_path);
             let original_bn = name_str.to_string();
-            let bn = find_free_bn(&original_bn, |n| result.files.contains_key(n));
+            let start = next_suffix.get(&original_bn).copied().unwrap_or(1);
+            let (bn, next) =
+                find_free_bn(&original_bn, start, |n| result.files.contains_key(n));
+            next_suffix.insert(original_bn.clone(), next);
             if bn != original_bn {
                 log::debug!("Collision resolved: {:?} -> {:?}", original_bn, bn);
             }
@@ -176,7 +209,7 @@ pub fn scan_tree(root: &Path, show_hidden: bool) -> ScanResult {
         tagdirs: HashMap::new(),
         by_tags: HashMap::new(),
     };
-    scan_dir(root, Path::new(""), show_hidden, &mut result);
+    scan_dir(root, Path::new(""), show_hidden, &mut result, &mut HashMap::new());
     result
 }
 
@@ -281,32 +314,32 @@ mod tests {
     #[test]
     fn find_free_bn_no_collision() {
         let existing: HashSet<String> = HashSet::new();
-        assert_eq!(find_free_bn("file.txt", |n| existing.contains(n)), "file.txt");
+        assert_eq!(find_free_bn("file.txt", 1, |n| existing.contains(n)).0, "file.txt");
     }
 
     #[test]
     fn find_free_bn_one_collision() {
         let existing: HashSet<String> = HashSet::from(["file.txt".into()]);
-        assert_eq!(find_free_bn("file.txt", |n| existing.contains(n)), "file.__1.txt");
+        assert_eq!(find_free_bn("file.txt", 1, |n| existing.contains(n)).0, "file.__1.txt");
     }
 
     #[test]
     fn find_free_bn_multi_collision() {
         let existing: HashSet<String> = HashSet::from(["file.txt".into(), "file.__1.txt".into()]);
-        assert_eq!(find_free_bn("file.txt", |n| existing.contains(n)), "file.__2.txt");
+        assert_eq!(find_free_bn("file.txt", 1, |n| existing.contains(n)).0, "file.__2.txt");
     }
 
     #[test]
     fn find_free_bn_no_ext() {
         let existing: HashSet<String> = HashSet::from(["README".into()]);
-        assert_eq!(find_free_bn("README", |n| existing.contains(n)), "README.__1");
+        assert_eq!(find_free_bn("README", 1, |n| existing.contains(n)).0, "README.__1");
     }
 
     #[test]
     fn find_free_bn_double_ext() {
         let existing: HashSet<String> = HashSet::from(["archive.tar.gz".into()]);
         assert_eq!(
-            find_free_bn("archive.tar.gz", |n| existing.contains(n)),
+            find_free_bn("archive.tar.gz", 1, |n| existing.contains(n)).0,
             "archive.tar.__1.gz"
         );
     }
@@ -563,6 +596,31 @@ mod tests {
         );
     }
 
+    /// Many directories holding the same filename is the case that made the
+    /// scan quadratic. Every file must still get its own basename, with no
+    /// index skipped or reused.
+    #[test]
+    fn scan_many_collisions_of_one_name() {
+        let dir = tempdir().unwrap();
+        for i in 0..50 {
+            let d = dir.path().join(format!("tag{i:02}"));
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("same.txt"), format!("{i}")).unwrap();
+        }
+
+        let result = scan_tree(dir.path(), false);
+
+        assert_eq!(result.files.len(), 50);
+        let mut expected: BTreeSet<String> = (1..50).map(|i| format!("same.__{i}.txt")).collect();
+        expected.insert("same.txt".to_string());
+        let got: BTreeSet<String> = result.files.keys().cloned().collect();
+        assert_eq!(got, expected);
+
+        // and each basename points at a distinct physical file
+        let ffns: BTreeSet<&PathBuf> = result.files.values().map(|e| &e.ffn).collect();
+        assert_eq!(ffns.len(), 50);
+    }
+
     #[test]
     fn scan_collision_marker_in_original_name() {
         let dir = tempdir().unwrap();
@@ -636,14 +694,14 @@ mod tests {
     fn find_free_bn_hidden_file_collision() {
         // ".hidden" → split_ext returns (".hidden", "") since rfind('.') pos=0 fails pos > 0
         let existing = HashSet::from([".hidden".to_string()]);
-        assert_eq!(find_free_bn(".hidden", |n| existing.contains(n)), ".hidden.__1");
+        assert_eq!(find_free_bn(".hidden", 1, |n| existing.contains(n)).0, ".hidden.__1");
     }
 
     #[test]
     fn find_free_bn_dot_only() {
         // "." → split_ext returns (".", "") — degenerate but shouldn't panic
         let existing = HashSet::from([".".to_string()]);
-        assert_eq!(find_free_bn(".", |n| existing.contains(n)), "..__1");
+        assert_eq!(find_free_bn(".", 1, |n| existing.contains(n)).0, "..__1");
     }
 
     #[test]
@@ -660,7 +718,7 @@ mod tests {
             "f.__1.txt".to_string(),
             "f.__3.txt".to_string(),
         ]);
-        assert_eq!(find_free_bn("f.txt", |n| existing.contains(n)), "f.__2.txt");
+        assert_eq!(find_free_bn("f.txt", 1, |n| existing.contains(n)).0, "f.__2.txt");
     }
 
     #[test]
@@ -685,3 +743,4 @@ mod tests {
             .contains_key(&BTreeSet::from(["tag3".into()])));
     }
 }
+
