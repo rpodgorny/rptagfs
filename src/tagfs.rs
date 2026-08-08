@@ -143,19 +143,89 @@ struct FsState {
     tagdirs: HashMap<BTreeSet<String>, HashSet<PathBuf>>,
     by_tags: HashMap<String, HashSet<String>>,
     inode_table: InodeTable,
+    /// tag -> the tagdirs keys containing it.
+    ///
+    /// get_avail_tags used to scan every key in tagdirs on every call, and it
+    /// is called on every lookup: 259us per root lookup on a tree with 3000
+    /// tag sets, against 2us for the same lookup on the source. This lets it
+    /// scan only the keys that can possibly match, and its key set doubles as
+    /// the list of tags that exist, which is the answer at the root.
+    tag_index: HashMap<String, HashSet<BTreeSet<String>>>,
 }
 
 impl FsState {
-    /// Return tags that can still be navigated into from the current tag set.
-    fn get_avail_tags(&self, current_tags: &BTreeSet<String>) -> BTreeSet<String> {
-        let mut result = BTreeSet::new();
+    fn new(
+        files: HashMap<String, FileEntry>,
+        tagdirs: HashMap<BTreeSet<String>, HashSet<PathBuf>>,
+        by_tags: HashMap<String, HashSet<String>>,
+    ) -> Self {
+        let mut state = Self {
+            files,
+            tagdirs,
+            by_tags,
+            inode_table: InodeTable::new(),
+            tag_index: HashMap::new(),
+        };
+        state.rebuild_tag_index();
+        state
+    }
+
+    fn rebuild_tag_index(&mut self) {
+        self.tag_index.clear();
         for key in self.tagdirs.keys() {
-            if current_tags.is_subset(key) {
-                result.extend(key.iter().cloned());
+            for tag in key {
+                self.tag_index.entry(tag.clone()).or_default().insert(key.clone());
             }
         }
-        for tag in current_tags {
-            result.remove(tag);
+    }
+
+    /// Record a physical directory for a tag set, keeping tag_index in step.
+    fn add_tagdir(&mut self, key: BTreeSet<String>, path: PathBuf) {
+        for tag in &key {
+            self.tag_index.entry(tag.clone()).or_default().insert(key.clone());
+        }
+        self.tagdirs.entry(key).or_default().insert(path);
+    }
+
+    /// Drop a tag set entirely, keeping tag_index in step.
+    fn remove_tagdir(&mut self, key: &BTreeSet<String>) {
+        for tag in key {
+            if let Some(keys) = self.tag_index.get_mut(tag) {
+                keys.remove(key);
+                // A tag with no directories left no longer exists.
+                if keys.is_empty() {
+                    self.tag_index.remove(tag);
+                }
+            }
+        }
+        self.tagdirs.remove(key);
+    }
+
+    /// Return tags that can still be navigated into from the current tag set.
+    fn get_avail_tags(&self, current_tags: &BTreeSet<String>) -> BTreeSet<String> {
+        // At the root every tag set matches, so the answer is every tag that
+        // exists - which is exactly what tag_index is keyed by.
+        if current_tags.is_empty() {
+            return self.tag_index.keys().cloned().collect();
+        }
+        // Otherwise only keys holding the rarest of the current tags can be
+        // supersets of all of them, so scan those instead of every key.
+        let Some(candidates) = current_tags
+            .iter()
+            .filter_map(|t| self.tag_index.get(t))
+            .min_by_key(|keys| keys.len())
+        else {
+            return BTreeSet::new();
+        };
+        let mut result = BTreeSet::new();
+        for key in candidates {
+            if current_tags.is_subset(key) {
+                for tag in key {
+                    if !current_tags.contains(tag) && !result.contains(tag) {
+                        result.insert(tag.clone());
+                    }
+                }
+            }
         }
         result
     }
@@ -234,7 +304,7 @@ impl FsState {
         // For empty tag set, return empty path (source root)
         if tags.is_empty() {
             let path = PathBuf::from("");
-            self.tagdirs.entry(key).or_default().insert(path.clone());
+            self.add_tagdir(key, path.clone());
             return Ok(path);
         }
 
@@ -245,7 +315,7 @@ impl FsState {
 
         std::fs::create_dir_all(&full_path)?;
 
-        self.tagdirs.entry(key).or_default().insert(rel_path.clone());
+        self.add_tagdir(key, rel_path.clone());
 
         // Ensure all tags have entries in by_tags
         for tag in tags {
@@ -465,6 +535,9 @@ impl FsState {
             }
         }
 
+        // tagdirs was rebuilt wholesale above, so redo the index from it.
+        self.rebuild_tag_index();
+
         // Update by_tags
         let file_set = self.by_tags.remove(old_tag).unwrap_or_default();
         self.by_tags.insert(new_tag.to_string(), file_set);
@@ -515,12 +588,7 @@ impl TagFs {
     pub fn new(root: PathBuf, scan: ScanResult) -> Self {
         Self {
             root,
-            state: RwLock::new(FsState {
-                files: scan.files,
-                tagdirs: scan.tagdirs,
-                by_tags: scan.by_tags,
-                inode_table: InodeTable::new(),
-            }),
+            state: RwLock::new(FsState::new(scan.files, scan.tagdirs, scan.by_tags)),
             dir_handles: Mutex::new(HashMap::new()),
             // fuse3 reads fh 0 as "stateless", so hand out handles from 1.
             next_fh: AtomicU64::new(1),
@@ -1331,7 +1399,7 @@ impl Filesystem for TagFs {
             }
 
             // Remove from state
-            state.tagdirs.remove(&child_tags);
+            state.remove_tagdir(&child_tags);
             state.inode_table.remove_dir(&child_tags);
 
             Ok(())
@@ -1645,12 +1713,7 @@ mod tests {
 
     fn scan_to_state(root: &std::path::Path) -> FsState {
         let scan = crate::scanner::scan_tree(root, false);
-        FsState {
-            files: scan.files,
-            tagdirs: scan.tagdirs,
-            by_tags: scan.by_tags,
-            inode_table: InodeTable::new(),
-        }
+        FsState::new(scan.files, scan.tagdirs, scan.by_tags)
     }
 
     fn make_test_state() -> FsState {
@@ -1786,6 +1849,45 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(readdir_paged(&fs, ALL_INODE, 100).await, first);
         }
+    }
+
+    /// tag_index is derived state, so a mutation path that forgets to update
+    /// it would silently make get_avail_tags list tags that no longer exist,
+    /// or hide ones that do. Check it against a rebuild after each mutation.
+    #[test]
+    fn tag_index_stays_consistent_with_tagdirs() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut state = make_physical_state(&root);
+
+        let check = |state: &mut FsState, what: &str| {
+            let live = state.tag_index.clone();
+            state.rebuild_tag_index();
+            assert_eq!(live, state.tag_index, "tag_index stale after {what}");
+        };
+        check(&mut state, "scan");
+
+        let jazz = BTreeSet::from(["jazz".to_string()]);
+        state.get_dir_for_tags(&jazz, &root).unwrap();
+        check(&mut state, "get_dir_for_tags");
+
+        state.rename_tag("jazz", "blues", &root).unwrap();
+        check(&mut state, "rename_tag");
+        assert!(state.get_avail_tags(&BTreeSet::new()).contains("blues"));
+
+        state.remove_tagdir(&BTreeSet::from(["blues".to_string()]));
+        check(&mut state, "remove_tagdir");
+        assert!(!state.get_avail_tags(&BTreeSet::new()).contains("blues"));
+
+        state
+            .add_remove_tags(
+                "song.mp3",
+                &BTreeSet::from(["live".to_string()]),
+                &BTreeSet::new(),
+                &root,
+            )
+            .unwrap();
+        check(&mut state, "add_remove_tags");
     }
 
     // --- get_avail_tags tests ---
@@ -1948,12 +2050,7 @@ mod tests {
             .or_default()
             .insert("music".to_string());
 
-        let state = FsState {
-            files,
-            tagdirs,
-            by_tags,
-            inode_table: InodeTable::new(),
-        };
+        let state = FsState::new(files, tagdirs, by_tags);
 
         // "music" file should be findable via matching_files
         let rock_files = state.get_matching_files(&BTreeSet::from(["rock".to_string()]));
@@ -1966,12 +2063,7 @@ mod tests {
 
     #[test]
     fn empty_filesystem() {
-        let state = FsState {
-            files: HashMap::new(),
-            tagdirs: HashMap::new(),
-            by_tags: HashMap::new(),
-            inode_table: InodeTable::new(),
-        };
+        let state = FsState::new(HashMap::new(), HashMap::new(), HashMap::new());
 
         assert!(state.get_avail_tags(&BTreeSet::new()).is_empty());
         assert!(state.get_matching_files(&BTreeSet::new()).is_empty());
@@ -1988,12 +2080,7 @@ mod tests {
             },
         );
 
-        let state = FsState {
-            files,
-            tagdirs: HashMap::new(),
-            by_tags: HashMap::new(),
-            inode_table: InodeTable::new(),
-        };
+        let state = FsState::new(files, HashMap::new(), HashMap::new());
 
         let root_files = state.get_matching_files(&BTreeSet::new());
         assert_eq!(root_files.len(), 1);
@@ -2036,12 +2123,7 @@ mod tests {
                 .insert("file.txt".to_string());
         }
 
-        let state = FsState {
-            files,
-            tagdirs,
-            by_tags,
-            inode_table: InodeTable::new(),
-        };
+        let state = FsState::new(files, tagdirs, by_tags);
 
         // At root, all 5 tags available
         let root_avail = state.get_avail_tags(&BTreeSet::new());
@@ -2123,12 +2205,7 @@ mod tests {
                 tags: BTreeSet::from(["music".to_string()]),
             },
         );
-        let state = FsState {
-            files,
-            tagdirs: HashMap::new(),
-            by_tags: HashMap::new(),
-            inode_table: InodeTable::new(),
-        };
+        let state = FsState::new(files, HashMap::new(), HashMap::new());
         assert!(state.get_untagged_files().is_empty());
     }
 
@@ -2149,12 +2226,7 @@ mod tests {
                 tags: BTreeSet::new(),
             },
         );
-        let state = FsState {
-            files,
-            tagdirs: HashMap::new(),
-            by_tags: HashMap::new(),
-            inode_table: InodeTable::new(),
-        };
+        let state = FsState::new(files, HashMap::new(), HashMap::new());
         let untagged = state.get_untagged_files();
         assert_eq!(untagged.len(), 2);
         assert!(untagged.contains("a.txt"));
@@ -2163,12 +2235,7 @@ mod tests {
 
     #[test]
     fn empty_filesystem_untagged() {
-        let state = FsState {
-            files: HashMap::new(),
-            tagdirs: HashMap::new(),
-            by_tags: HashMap::new(),
-            inode_table: InodeTable::new(),
-        };
+        let state = FsState::new(HashMap::new(), HashMap::new(), HashMap::new());
         assert!(state.get_untagged_files().is_empty());
     }
 
@@ -2960,7 +3027,7 @@ mod tests {
                 fs::remove_dir(root.join(&d)).unwrap();
             }
         }
-        state.tagdirs.remove(&child_tags);
+        state.remove_tagdir(&child_tags);
         state.inode_table.remove_dir(&child_tags);
 
         // Verify rmdir
@@ -3754,3 +3821,4 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
