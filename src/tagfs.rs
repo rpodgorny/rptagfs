@@ -141,6 +141,21 @@ impl FsState {
             .collect()
     }
 
+    /// Per-tag file sets plus the index of the smallest one.
+    /// None if any tag is unknown (no file can match).
+    fn tag_sets(&self, tags: &BTreeSet<String>) -> Option<(Vec<&HashSet<String>>, usize)> {
+        let mut sets = Vec::with_capacity(tags.len());
+        for tag in tags {
+            sets.push(self.by_tags.get(tag)?);
+        }
+        let small = sets.iter().enumerate().min_by_key(|(_, s)| s.len())?.0;
+        Some((sets, small))
+    }
+
+    fn in_all(sets: &[&HashSet<String>], small: usize, bn: &str) -> bool {
+        sets.iter().enumerate().all(|(i, s)| i == small || s.contains(bn))
+    }
+
     /// Return basenames of files matching all the given tags.
     /// Scans the rarest tag's set, so cost is bounded by the smallest tag,
     /// not by the first one alphabetically.
@@ -148,23 +163,32 @@ impl FsState {
         if tags.is_empty() {
             return self.files.keys().cloned().collect();
         }
-        let mut sets = Vec::with_capacity(tags.len());
-        for tag in tags {
-            match self.by_tags.get(tag) {
-                Some(s) => sets.push(s),
-                None => return HashSet::new(),
-            }
-        }
-        let small = sets.iter().enumerate().min_by_key(|(_, s)| s.len()).unwrap().0;
+        let Some((sets, small)) = self.tag_sets(tags) else {
+            return HashSet::new();
+        };
         sets[small]
             .iter()
-            .filter(|bn| {
-                sets.iter()
-                    .enumerate()
-                    .all(|(i, s)| i == small || s.contains(*bn))
-            })
+            .filter(|bn| Self::in_all(&sets, small, bn))
             .cloned()
             .collect()
+    }
+
+    /// Count files matching all the given tags without building any set.
+    /// O(1) for zero or one tag, O(k * smallest set) beyond that.
+    fn count_matching_files(&self, tags: &BTreeSet<String>) -> usize {
+        if tags.is_empty() {
+            return self.files.len();
+        }
+        let Some((sets, small)) = self.tag_sets(tags) else {
+            return 0;
+        };
+        if sets.len() == 1 {
+            return sets[0].len();
+        }
+        sets[small]
+            .iter()
+            .filter(|bn| Self::in_all(&sets, small, bn))
+            .count()
     }
 
     /// Determine file type (symlink vs regular) for a file basename.
@@ -461,12 +485,21 @@ impl TagFs {
         }
     }
 
-    /// Synthetic directory attributes.
-    fn dir_attr(&self, ino: u64) -> FileAttr {
+    /// Synthetic directory attributes. `size` is the number of files visible
+    /// in that directory, i.e. matching its whole tag path.
+    fn dir_attr(&self, ino: u64, state: &FsState) -> FileAttr {
+        let size = match state.inode_table.get(ino) {
+            Some(InodeEntry::Dir(tags)) => state.count_matching_files(tags),
+            Some(InodeEntry::SpecialDir(SpecialKind::All)) => state.files.len(),
+            Some(InodeEntry::SpecialDir(SpecialKind::Untagged)) => {
+                state.files.values().filter(|e| e.tags.is_empty()).count()
+            }
+            _ => 0,
+        } as u64;
         let now = SystemTime::now();
         FileAttr {
             ino,
-            size: 0,
+            size,
             blocks: 0,
             atime: now.into(),
             mtime: now.into(),
@@ -554,11 +587,11 @@ impl Filesystem for TagFs {
                 // At root, check for special directory names first
                 if is_root {
                     if name_str == SPECIAL_ALL_NAME {
-                        let attr = self.dir_attr(ALL_INODE);
+                        let attr = self.dir_attr(ALL_INODE, &state);
                         return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
                     }
                     if name_str == SPECIAL_UNTAGGED_NAME {
-                        let attr = self.dir_attr(UNTAGGED_INODE);
+                        let attr = self.dir_attr(UNTAGGED_INODE, &state);
                         return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
                     }
                 }
@@ -585,7 +618,7 @@ impl Filesystem for TagFs {
                     drop(state);
                     let mut state = self.state.write().unwrap();
                     let ino = state.inode_table.get_or_alloc_dir(&child_tags);
-                    let attr = self.dir_attr(ino);
+                    let attr = self.dir_attr(ino, &state);
                     log::debug!("lookup: parent={} name={:?} -> dir inode {}", parent, name_str, ino);
                     return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
                 }
@@ -630,7 +663,7 @@ impl Filesystem for TagFs {
                 log::debug!("getattr: inode {} -> dir", inode);
                 Ok(ReplyAttr {
                     ttl: TTL,
-                    attr: self.dir_attr(inode),
+                    attr: self.dir_attr(inode, &state),
                 })
             }
             Some(InodeEntry::File(basename)) => {
@@ -656,7 +689,7 @@ impl Filesystem for TagFs {
                 // For directories, return synthetic attrs unchanged
                 Ok(ReplyAttr {
                     ttl: TTL,
-                    attr: self.dir_attr(inode),
+                    attr: self.dir_attr(inode, &state),
                 })
             }
             Some(InodeEntry::File(basename)) => {
@@ -860,7 +893,7 @@ impl Filesystem for TagFs {
         let mut idx: i64 = 1;
 
         // "." entry
-        let dot_attr = self.dir_attr(parent);
+        let dot_attr = self.dir_attr(parent, &state);
         entries.push(Ok(DirectoryEntryPlus {
             inode: parent,
             generation: 0,
@@ -874,7 +907,7 @@ impl Filesystem for TagFs {
         idx += 1;
 
         // ".." entry
-        let dotdot_attr = self.dir_attr(ROOT_INODE);
+        let dotdot_attr = self.dir_attr(ROOT_INODE, &state);
         entries.push(Ok(DirectoryEntryPlus {
             inode: ROOT_INODE,
             generation: 0,
@@ -894,7 +927,7 @@ impl Filesystem for TagFs {
 
                 // At root, emit special directories
                 if is_root {
-                    let all_attr = self.dir_attr(ALL_INODE);
+                    let all_attr = self.dir_attr(ALL_INODE, &state);
                     entries.push(Ok(DirectoryEntryPlus {
                         inode: ALL_INODE,
                         generation: 0,
@@ -906,7 +939,7 @@ impl Filesystem for TagFs {
                         attr_ttl: TTL,
                     }));
                     idx += 1;
-                    let untagged_attr = self.dir_attr(UNTAGGED_INODE);
+                    let untagged_attr = self.dir_attr(UNTAGGED_INODE, &state);
                     entries.push(Ok(DirectoryEntryPlus {
                         inode: UNTAGGED_INODE,
                         generation: 0,
@@ -925,7 +958,7 @@ impl Filesystem for TagFs {
                     let mut child_tags = tags.clone();
                     child_tags.insert(tag.clone());
                     let child_ino = state.inode_table.get_or_alloc_dir(&child_tags);
-                    let attr = self.dir_attr(child_ino);
+                    let attr = self.dir_attr(child_ino, &state);
                     entries.push(Ok(DirectoryEntryPlus {
                         inode: child_ino,
                         generation: 0,
@@ -1296,7 +1329,7 @@ impl Filesystem for TagFs {
 
         // Allocate inode
         let ino = state.inode_table.get_or_alloc_dir(&child_tags);
-        let attr = self.dir_attr(ino);
+        let attr = self.dir_attr(ino, &state);
 
         Ok(ReplyEntry { ttl: TTL, attr, generation: 0 })
     }
@@ -1662,6 +1695,31 @@ mod tests {
         let state = make_test_state();
         let files = state.get_matching_files(&BTreeSet::from(["nonexistent".to_string()]));
         assert!(files.is_empty());
+    }
+
+    /// count_matching_files must agree with get_matching_files everywhere,
+    /// including its O(1) shortcuts for zero and one tag.
+    #[test]
+    fn count_matching_files_matches_get() {
+        let state = make_test_state();
+        let mut tag_sets = vec![
+            BTreeSet::new(),
+            BTreeSet::from(["nonexistent".to_string()]),
+            BTreeSet::from(["music".to_string(), "nonexistent".to_string()]),
+        ];
+        for tag in state.by_tags.keys() {
+            tag_sets.push(BTreeSet::from([tag.clone()]));
+            for other in state.by_tags.keys() {
+                tag_sets.push(BTreeSet::from([tag.clone(), other.clone()]));
+            }
+        }
+        for tags in tag_sets {
+            assert_eq!(
+                state.count_matching_files(&tags),
+                state.get_matching_files(&tags).len(),
+                "tags {tags:?}"
+            );
+        }
     }
 
     #[test]
