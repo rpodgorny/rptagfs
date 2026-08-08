@@ -512,7 +512,15 @@ impl TagFs {
             ctime: now.into(),
             kind: FileType::Directory,
             perm: 0o755,
-            nlink: 2,
+            // Convention is 2 + subdirectory count, and 2 therefore claims
+            // "leaf directory, no subdirs" - a lie for every tag dir. find(1)
+            // and friends use that to skip descending (hence its -noleaf flag).
+            // A count below 2 is the accepted "unreliable, do not optimize"
+            // signal, used by btrfs and various network filesystems, so tools
+            // just descend normally. The honest count would be
+            // get_avail_tags(tags).len() + 2, but get_avail_tags scans every
+            // key in tagdirs - per directory, times every child in a readdir.
+            nlink: 1,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             rdev: 0,
