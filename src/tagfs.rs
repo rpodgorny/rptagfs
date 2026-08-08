@@ -4,7 +4,7 @@ use std::num::NonZeroU32;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
@@ -502,14 +502,22 @@ impl TagFs {
             }
             _ => 0,
         } as u64;
-        let now = SystemTime::now();
         FileAttr {
             ino,
             size,
             blocks: 0,
-            atime: now.into(),
-            mtime: now.into(),
-            ctime: now.into(),
+            // Tag directories are synthetic and have no modification time, so
+            // report the epoch rather than invent one. This used to be
+            // SystemTime::now(), evaluated per request, so every stat returned
+            // a different mtime and nothing could tell "changed" from "asked
+            // again" - it broke make, rsync and backup tools and made the attr
+            // TTL pointless. Anything stable fixes that; the epoch is the
+            // option that does not also lie. It shows up as "Jan 1 1970" in
+            // ls -l, which is the intended tell. The informative alternative
+            // is the mtime of the backing dir in tagdirs, one stat per call.
+            atime: UNIX_EPOCH.into(),
+            mtime: UNIX_EPOCH.into(),
+            ctime: UNIX_EPOCH.into(),
             kind: FileType::Directory,
             perm: 0o755,
             // Convention is 2 + subdirectory count, and 2 therefore claims
