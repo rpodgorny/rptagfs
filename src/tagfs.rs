@@ -3,14 +3,15 @@ use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
 use fuse3::{Errno, Result as FuseResult, Timestamp};
 use futures_util::stream;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 
 use crate::scanner::{FileEntry, ScanResult};
 
@@ -205,19 +206,6 @@ impl FsState {
             .iter()
             .filter(|bn| Self::in_all(&sets, small, bn))
             .count()
-    }
-
-    /// Determine file type (symlink vs regular) for a file basename.
-    fn file_kind(&self, root: &Path, basename: &str) -> FileType {
-        if let Some(fe) = self.files.get(basename) {
-            let full_path = root.join(&fe.ffn);
-            match std::fs::symlink_metadata(&full_path) {
-                Ok(m) if m.file_type().is_symlink() => FileType::Symlink,
-                _ => FileType::RegularFile,
-            }
-        } else {
-            FileType::RegularFile
-        }
     }
 
     /// Get or create a physical directory for a tag set.
@@ -483,9 +471,29 @@ impl FsState {
     }
 }
 
+/// One directory entry, held in an open directory's snapshot.
+/// Carries the attributes too, so readdirplus needs no further stat.
+struct SnapEntry {
+    inode: u64,
+    kind: FileType,
+    name: OsString,
+    attr: FileAttr,
+}
+
 pub struct TagFs {
     root: PathBuf,
     state: RwLock<FsState>,
+    /// Entry list per open directory handle, built once in opendir.
+    ///
+    /// readdir is paged: the kernel re-calls it with a growing offset, and
+    /// rebuilding the list per call meant O(entries) work and one stat per
+    /// file *per page*, so a full listing cost O(entries * pages) stats -
+    /// ~400 rebuilds and 5s for 40k files locally, far worse over a network
+    /// mount. Snapshotting at open makes that one build per listing and a
+    /// page a slice. Entries added or removed mid-listing are not reflected,
+    /// which is normal readdir behaviour.
+    dir_handles: Mutex<HashMap<u64, Arc<Vec<SnapEntry>>>>,
+    next_fh: AtomicU64,
 }
 
 impl TagFs {
@@ -498,7 +506,111 @@ impl TagFs {
                 by_tags: scan.by_tags,
                 inode_table: InodeTable::new(),
             }),
+            dir_handles: Mutex::new(HashMap::new()),
+            // fuse3 reads fh 0 as "stateless", so hand out handles from 1.
+            next_fh: AtomicU64::new(1),
         }
+    }
+
+    /// Build the full entry list for a directory, in stable order.
+    fn build_dir_entries(&self, inode: u64, state: &mut FsState) -> FuseResult<Vec<SnapEntry>> {
+        let inode_entry = state.inode_table.get(inode).cloned();
+        let mut entries = Vec::new();
+
+        entries.push(SnapEntry {
+            inode,
+            kind: FileType::Directory,
+            name: OsString::from("."),
+            attr: self.dir_attr(inode, state),
+        });
+        // ".." points at the root for simplicity: a tag set has no one parent.
+        entries.push(SnapEntry {
+            inode: ROOT_INODE,
+            kind: FileType::Directory,
+            name: OsString::from(".."),
+            attr: self.dir_attr(ROOT_INODE, state),
+        });
+
+        match inode_entry {
+            Some(InodeEntry::Dir(ref tags)) => {
+                let is_root = inode == ROOT_INODE;
+                let avail_tags = state.get_avail_tags(tags);
+
+                if is_root {
+                    for (ino, name) in [
+                        (ALL_INODE, SPECIAL_ALL_NAME),
+                        (UNTAGGED_INODE, SPECIAL_UNTAGGED_NAME),
+                    ] {
+                        entries.push(SnapEntry {
+                            inode: ino,
+                            kind: FileType::Directory,
+                            name: OsString::from(name),
+                            attr: self.dir_attr(ino, state),
+                        });
+                    }
+                }
+
+                // Available tags as subdirectories (BTreeSet, already ordered).
+                for tag in &avail_tags {
+                    let mut child_tags = tags.clone();
+                    child_tags.insert(tag.clone());
+                    let child_ino = state.inode_table.get_or_alloc_dir(&child_tags);
+                    entries.push(SnapEntry {
+                        inode: child_ino,
+                        kind: FileType::Directory,
+                        name: OsString::from(tag),
+                        attr: self.dir_attr(child_ino, state),
+                    });
+                }
+
+                // Non-root: also emit matching files. Tags win on a name clash.
+                if !is_root {
+                    let matching = state.get_matching_files(tags);
+                    for basename in sorted_names(&matching) {
+                        if avail_tags.contains(basename) {
+                            continue;
+                        }
+                        self.push_file_entry(&mut entries, basename, state);
+                    }
+                }
+            }
+            Some(InodeEntry::SpecialDir(ref kind)) => {
+                let file_set = match kind {
+                    SpecialKind::All => state.get_matching_files(&BTreeSet::new()),
+                    SpecialKind::Untagged => state.get_untagged_files(),
+                };
+                for basename in sorted_names(&file_set) {
+                    self.push_file_entry(&mut entries, basename, state);
+                }
+            }
+            _ => return Err(libc::ENOTDIR.into()),
+        }
+
+        Ok(entries)
+    }
+
+    /// Append one file entry, skipping it if the physical file cannot be stat'ed.
+    fn push_file_entry(&self, entries: &mut Vec<SnapEntry>, basename: &str, state: &mut FsState) {
+        let ino = state.inode_table.get_or_alloc_file(basename);
+        match self.file_attr(ino, basename, state) {
+            Ok(attr) => entries.push(SnapEntry {
+                inode: ino,
+                kind: attr.kind,
+                name: OsString::from(basename),
+                attr,
+            }),
+            Err(_) => log::debug!("readdir: skipping unstattable {:?}", basename),
+        }
+    }
+
+    /// Entry list for a directory being read: the snapshot taken by opendir,
+    /// or a fresh build if the kernel reads without a handle of ours.
+    fn dir_entries(&self, inode: u64, fh: u64) -> FuseResult<Arc<Vec<SnapEntry>>> {
+        if let Some(snap) = self.dir_handles.lock().unwrap().get(&fh) {
+            return Ok(Arc::clone(snap));
+        }
+        let mut state = self.state.write().unwrap();
+        Ok(Arc::new(self.build_dir_entries(inode, &mut state)?))
     }
 
     /// Synthetic directory attributes. `size` is the number of files visible
@@ -798,121 +910,25 @@ impl Filesystem for TagFs {
         &self,
         _req: Request,
         inode: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
     ) -> FuseResult<ReplyDirectory<impl Stream<Item = FuseResult<DirectoryEntry>> + Send + '_>> {
-        let mut state = self.state.write().unwrap();
+        let snap = self.dir_entries(inode, fh)?;
+        let (start, len) = (offset.max(0) as usize, snap.len());
+        log::debug!("readdir: inode {} fh {} offset {} of {}", inode, fh, offset, len);
 
-        let inode_entry = state.inode_table.get(inode).cloned();
-
-        let mut entries = Vec::new();
-        let mut idx: i64 = 1;
-
-        // "." entry
-        entries.push(Ok(DirectoryEntry {
-            inode,
-            kind: FileType::Directory,
-            name: OsString::from("."),
-            offset: idx,
-        }));
-        idx += 1;
-
-        // ".." entry (point to root for simplicity)
-        entries.push(Ok(DirectoryEntry {
-            inode: ROOT_INODE,
-            kind: FileType::Directory,
-            name: OsString::from(".."),
-            offset: idx,
-        }));
-        idx += 1;
-
-        match inode_entry {
-            Some(InodeEntry::Dir(ref tags)) => {
-                let is_root = inode == ROOT_INODE;
-                let avail_tags = state.get_avail_tags(tags);
-
-                // At root, emit special directories
-                if is_root {
-                    entries.push(Ok(DirectoryEntry {
-                        inode: ALL_INODE,
-                        kind: FileType::Directory,
-                        name: OsString::from(SPECIAL_ALL_NAME),
-                        offset: idx,
-                    }));
-                    idx += 1;
-                    entries.push(Ok(DirectoryEntry {
-                        inode: UNTAGGED_INODE,
-                        kind: FileType::Directory,
-                        name: OsString::from(SPECIAL_UNTAGGED_NAME),
-                        offset: idx,
-                    }));
-                    idx += 1;
-                }
-
-                // Available tags as directories
-                for tag in &avail_tags {
-                    let mut child_tags = tags.clone();
-                    child_tags.insert(tag.clone());
-                    let child_ino = state.inode_table.get_or_alloc_dir(&child_tags);
-                    entries.push(Ok(DirectoryEntry {
-                        inode: child_ino,
-                        kind: FileType::Directory,
-                        name: OsString::from(tag),
-                        offset: idx,
-                    }));
-                    idx += 1;
-                }
-
-                // Non-root: also emit matching files
-                if !is_root {
-                    let matching_files = state.get_matching_files(tags);
-                    let names = sorted_names(&matching_files);
-                    let root = self.root.clone();
-                    for basename in names {
-                        if avail_tags.contains(basename) {
-                            continue;
-                        }
-                        let file_ino = state.inode_table.get_or_alloc_file(basename);
-                        entries.push(Ok(DirectoryEntry {
-                            inode: file_ino,
-                            kind: state.file_kind(&root, basename),
-                            name: OsString::from(basename),
-                            offset: idx,
-                        }));
-                        idx += 1;
-                    }
-                }
-            }
-            Some(InodeEntry::SpecialDir(ref kind)) => {
-                let file_set = match kind {
-                    SpecialKind::All => state.get_matching_files(&BTreeSet::new()),
-                    SpecialKind::Untagged => state.get_untagged_files(),
-                };
-                let root = self.root.clone();
-                for basename in sorted_names(&file_set) {
-                    let file_ino = state.inode_table.get_or_alloc_file(basename);
-                    entries.push(Ok(DirectoryEntry {
-                        inode: file_ino,
-                        kind: state.file_kind(&root, basename),
-                        name: OsString::from(basename),
-                        offset: idx,
-                    }));
-                    idx += 1;
-                }
-            }
-            _ => return Err(libc::ENOTDIR.into()),
-        }
-
-        log::debug!("readdir: inode {} -> {} entries", inode, entries.len());
-
-        let entries: Vec<_> = if offset > 0 {
-            entries.into_iter().skip(offset as usize).collect()
-        } else {
-            entries
-        };
-
+        // Entries are cloned as the consumer pulls them, so serving a page
+        // costs the page, not the whole directory.
         Ok(ReplyDirectory {
-            entries: stream::iter(entries),
+            entries: stream::iter(start..len).map(move |i| {
+                let e = &snap[i];
+                Ok(DirectoryEntry {
+                    inode: e.inode,
+                    kind: e.kind,
+                    name: e.name.clone(),
+                    offset: i as i64 + 1,
+                })
+            }),
         })
     }
 
@@ -920,160 +936,28 @@ impl Filesystem for TagFs {
         &self,
         _req: Request,
         parent: u64,
-        _fh: u64,
+        fh: u64,
         offset: u64,
         _lock_owner: u64,
     ) -> FuseResult<ReplyDirectoryPlus<impl Stream<Item = FuseResult<DirectoryEntryPlus>> + Send + '_>> {
-        let mut state = self.state.write().unwrap();
-
-        let inode_entry = state.inode_table.get(parent).cloned();
-
-        let mut entries = Vec::new();
-        let mut idx: i64 = 1;
-
-        // "." entry
-        let dot_attr = self.dir_attr(parent, &state);
-        entries.push(Ok(DirectoryEntryPlus {
-            inode: parent,
-            generation: 0,
-            kind: FileType::Directory,
-            name: OsString::from("."),
-            offset: idx,
-            attr: dot_attr,
-            entry_ttl: TTL,
-            attr_ttl: TTL,
-        }));
-        idx += 1;
-
-        // ".." entry
-        let dotdot_attr = self.dir_attr(ROOT_INODE, &state);
-        entries.push(Ok(DirectoryEntryPlus {
-            inode: ROOT_INODE,
-            generation: 0,
-            kind: FileType::Directory,
-            name: OsString::from(".."),
-            offset: idx,
-            attr: dotdot_attr,
-            entry_ttl: TTL,
-            attr_ttl: TTL,
-        }));
-        idx += 1;
-
-        match inode_entry {
-            Some(InodeEntry::Dir(ref tags)) => {
-                let is_root = parent == ROOT_INODE;
-                let avail_tags = state.get_avail_tags(tags);
-
-                // At root, emit special directories
-                if is_root {
-                    let all_attr = self.dir_attr(ALL_INODE, &state);
-                    entries.push(Ok(DirectoryEntryPlus {
-                        inode: ALL_INODE,
-                        generation: 0,
-                        kind: FileType::Directory,
-                        name: OsString::from(SPECIAL_ALL_NAME),
-                        offset: idx,
-                        attr: all_attr,
-                        entry_ttl: TTL,
-                        attr_ttl: TTL,
-                    }));
-                    idx += 1;
-                    let untagged_attr = self.dir_attr(UNTAGGED_INODE, &state);
-                    entries.push(Ok(DirectoryEntryPlus {
-                        inode: UNTAGGED_INODE,
-                        generation: 0,
-                        kind: FileType::Directory,
-                        name: OsString::from(SPECIAL_UNTAGGED_NAME),
-                        offset: idx,
-                        attr: untagged_attr,
-                        entry_ttl: TTL,
-                        attr_ttl: TTL,
-                    }));
-                    idx += 1;
-                }
-
-                // Available tags as directories
-                for tag in &avail_tags {
-                    let mut child_tags = tags.clone();
-                    child_tags.insert(tag.clone());
-                    let child_ino = state.inode_table.get_or_alloc_dir(&child_tags);
-                    let attr = self.dir_attr(child_ino, &state);
-                    entries.push(Ok(DirectoryEntryPlus {
-                        inode: child_ino,
-                        generation: 0,
-                        kind: FileType::Directory,
-                        name: OsString::from(tag),
-                        offset: idx,
-                        attr,
-                        entry_ttl: TTL,
-                        attr_ttl: TTL,
-                    }));
-                    idx += 1;
-                }
-
-                // Non-root: also emit matching files
-                if !is_root {
-                    let matching_files = state.get_matching_files(tags);
-                    for basename in sorted_names(&matching_files) {
-                        if avail_tags.contains(basename) {
-                            continue;
-                        }
-                        let file_ino = state.inode_table.get_or_alloc_file(basename);
-                        let attr = match self.file_attr(file_ino, basename, &state) {
-                            Ok(a) => a,
-                            Err(_) => continue,
-                        };
-                        entries.push(Ok(DirectoryEntryPlus {
-                            inode: file_ino,
-                            generation: 0,
-                            kind: attr.kind,
-                            name: OsString::from(basename),
-                            offset: idx,
-                            attr,
-                            entry_ttl: TTL,
-                            attr_ttl: TTL,
-                        }));
-                        idx += 1;
-                    }
-                }
-            }
-            Some(InodeEntry::SpecialDir(ref kind)) => {
-                let file_set = match kind {
-                    SpecialKind::All => state.get_matching_files(&BTreeSet::new()),
-                    SpecialKind::Untagged => state.get_untagged_files(),
-                };
-                for basename in sorted_names(&file_set) {
-                    let file_ino = state.inode_table.get_or_alloc_file(basename);
-                    let attr = match self.file_attr(file_ino, basename, &state) {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    };
-                    entries.push(Ok(DirectoryEntryPlus {
-                        inode: file_ino,
-                        generation: 0,
-                        kind: attr.kind,
-                        name: OsString::from(basename),
-                        offset: idx,
-                        attr,
-                        entry_ttl: TTL,
-                        attr_ttl: TTL,
-                    }));
-                    idx += 1;
-                }
-            }
-            _ => return Err(libc::ENOTDIR.into()),
-        }
-
-        log::debug!("readdirplus: inode {} -> {} entries", parent, entries.len());
-
-        let entries: Vec<_> = if offset > 0 {
-            entries.into_iter().skip(offset as usize).collect()
-        } else {
-            entries
-        };
+        let snap = self.dir_entries(parent, fh)?;
+        let (start, len) = (offset as usize, snap.len());
+        log::debug!("readdirplus: inode {} fh {} offset {} of {}", parent, fh, offset, len);
 
         Ok(ReplyDirectoryPlus {
-            entries: stream::iter(entries),
+            entries: stream::iter(start..len).map(move |i| {
+                let e = &snap[i];
+                Ok(DirectoryEntryPlus {
+                    inode: e.inode,
+                    generation: 0,
+                    kind: e.kind,
+                    name: e.name.clone(),
+                    offset: i as i64 + 1,
+                    attr: e.attr,
+                    entry_ttl: TTL,
+                    attr_ttl: TTL,
+                })
+            }),
         })
     }
 
@@ -1249,22 +1133,25 @@ impl Filesystem for TagFs {
     }
 
     async fn opendir(&self, _req: Request, inode: u64, _flags: u32) -> FuseResult<ReplyOpen> {
-        let state = self.state.read().unwrap();
-        match state.inode_table.get(inode) {
-            Some(InodeEntry::Dir(_)) | Some(InodeEntry::SpecialDir(_)) => {
-                Ok(ReplyOpen { fh: 0, flags: 0 })
-            }
-            _ => Err(libc::ENOTDIR.into()),
-        }
+        let mut state = self.state.write().unwrap();
+        let entries = self.build_dir_entries(inode, &mut state)?;
+        drop(state);
+
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        log::debug!("opendir: inode {} -> fh {} ({} entries)", inode, fh, entries.len());
+        self.dir_handles.lock().unwrap().insert(fh, Arc::new(entries));
+        Ok(ReplyOpen { fh, flags: 0 })
     }
 
     async fn releasedir(
         &self,
         _req: Request,
         _inode: u64,
-        _fh: u64,
+        fh: u64,
         _flags: u32,
     ) -> FuseResult<()> {
+        self.dir_handles.lock().unwrap().remove(&fh);
+        log::debug!("releasedir: fh {}", fh);
         Ok(())
     }
 
@@ -1677,6 +1564,20 @@ mod tests {
         panic!("readdir did not terminate");
     }
 
+    /// Full entry list of a directory, in one page.
+    async fn readdir_entries(fs: &TagFs, inode: u64) -> Vec<DirectoryEntry> {
+        use futures_util::StreamExt;
+
+        let req = Request { unique: 0, uid: 0, gid: 0, pid: 0 };
+        fs.readdir(req, inode, 0, 0)
+            .await
+            .unwrap()
+            .entries
+            .map(|e| e.unwrap())
+            .collect()
+            .await
+    }
+
     /// 60 files, read 7 at a time. Before the fix each call rebuilt the entry
     /// list from a fresh HashSet with its own hash seed, so every page was cut
     /// out of a differently ordered list: entries were skipped and repeated.
@@ -1709,6 +1610,45 @@ mod tests {
             assert_eq!(files.len(), expected.len(), "{label}: duplicated entries");
             assert_eq!(&names[..2], &[".".to_string(), "..".to_string()]);
         }
+    }
+
+    /// The paged reads above go through fh 0, which rebuilds. This covers the
+    /// real path: opendir snapshots, readdir serves slices of it, releasedir
+    /// drops it.
+    #[tokio::test]
+    async fn opendir_snapshot_serves_pages_then_is_released() {
+        use futures_util::StreamExt;
+
+        let dir = tempdir().unwrap();
+        write_test_layout(dir.path());
+        let scan = crate::scanner::scan_tree(dir.path(), false);
+        let fs = TagFs::new(dir.path().to_path_buf(), scan);
+        let req = Request { unique: 0, uid: 0, gid: 0, pid: 0 };
+
+        let fh = fs.opendir(req, ALL_INODE, 0).await.unwrap().fh;
+        assert_ne!(fh, 0, "fh 0 means stateless to fuse3");
+        assert_eq!(fs.dir_handles.lock().unwrap().len(), 1);
+
+        let mut names = Vec::new();
+        let mut offset = 0i64;
+        loop {
+            let batch: Vec<DirectoryEntry> = fs
+                .readdir(req, ALL_INODE, fh, offset)
+                .await
+                .unwrap()
+                .entries
+                .take(2)
+                .map(|e| e.unwrap())
+                .collect()
+                .await;
+            let Some(last) = batch.last() else { break };
+            offset = last.offset;
+            names.extend(batch.iter().map(|e| e.name.to_string_lossy().to_string()));
+        }
+        assert_eq!(names, readdir_paged(&fs, ALL_INODE, 2).await);
+
+        fs.releasedir(req, ALL_INODE, fh, 0).await.unwrap();
+        assert!(fs.dir_handles.lock().unwrap().is_empty(), "handle leaked");
     }
 
     /// Entry order must not depend on the hash seed of a freshly built set.
@@ -3328,16 +3268,29 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn external_delete_file_kind_fallback() {
+    /// A file deleted behind our back cannot be stat'ed, so it is left out of
+    /// the listing rather than reported with guessed attributes.
+    #[tokio::test]
+    async fn external_delete_omits_file_from_listing() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let state = make_physical_state(&root);
+        let tagfs = make_test_tagfs(&root);
+        let music_ino = tagfs
+            .state
+            .write()
+            .unwrap()
+            .inode_table
+            .get_or_alloc_dir(&BTreeSet::from(["music".to_string()]));
+
+        assert!(readdir_paged(&tagfs, music_ino, 100)
+            .await
+            .contains(&"song.mp3".to_string()));
 
         fs::remove_file(root.join("music/song.mp3")).unwrap();
 
-        // file_kind falls back to RegularFile when stat fails
-        assert_eq!(state.file_kind(&root, "song.mp3"), FileType::RegularFile);
+        assert!(!readdir_paged(&tagfs, music_ino, 100)
+            .await
+            .contains(&"song.mp3".to_string()));
     }
 
     #[test]
@@ -3513,15 +3466,23 @@ mod tests {
         assert_eq!(state.files["song.mp3"].tags, BTreeSet::from(["music".to_string()]));
     }
 
-    #[test]
-    fn external_modify_file_kind_unchanged() {
+    #[tokio::test]
+    async fn external_modify_keeps_file_listed_as_regular() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let state = make_physical_state(&root);
+        let tagfs = make_test_tagfs(&root);
+        let music_ino = tagfs
+            .state
+            .write()
+            .unwrap()
+            .inode_table
+            .get_or_alloc_dir(&BTreeSet::from(["music".to_string()]));
 
         fs::write(root.join("music/song.mp3"), "different content").unwrap();
 
-        assert_eq!(state.file_kind(&root, "song.mp3"), FileType::RegularFile);
+        let entries = readdir_entries(&tagfs, music_ino).await;
+        let song = entries.iter().find(|e| e.name == "song.mp3").unwrap();
+        assert_eq!(song.kind, FileType::RegularFile);
     }
 
     // --- 5. Directory deleted from source ---
