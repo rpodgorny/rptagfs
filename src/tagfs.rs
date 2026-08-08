@@ -513,9 +513,46 @@ impl TagFs {
     }
 
     /// Build the full entry list for a directory, in stable order.
-    fn build_dir_entries(&self, inode: u64, state: &mut FsState) -> FuseResult<Vec<SnapEntry>> {
+    ///
+    /// Two phases on purpose. Planning touches only memory and runs under the
+    /// state lock; the stats then run with no lock held. Doing the stats under
+    /// the lock meant a listing of N files blocked every other operation on
+    /// the filesystem for N stats - on a network-backed source, N round trips.
+    fn build_dir_entries(&self, inode: u64) -> FuseResult<Vec<SnapEntry>> {
+        let (mut entries, pending) = {
+            let mut state = self.state.write().unwrap();
+            self.plan_dir_entries(inode, &mut state)?
+        };
+
+        for (idx, path) in pending {
+            match Self::stat_attr(entries[idx].inode, &path) {
+                Ok(attr) => {
+                    entries[idx].kind = attr.kind;
+                    entries[idx].attr = attr;
+                }
+                Err(e) => log::debug!(
+                    "readdir: cannot stat {:?}: {:?}, listing as placeholder",
+                    path,
+                    e
+                ),
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Plan a directory's entries without touching the disk.
+    ///
+    /// Returns the entries plus the physical paths still to be stat'ed, as
+    /// (index into entries, path). File entries come back holding placeholder
+    /// attributes, which is also what they keep if the stat later fails.
+    fn plan_dir_entries(
+        &self,
+        inode: u64,
+        state: &mut FsState,
+    ) -> FuseResult<(Vec<SnapEntry>, Vec<(usize, PathBuf)>)> {
         let inode_entry = state.inode_table.get(inode).cloned();
         let mut entries = Vec::new();
+        let mut pending = Vec::new();
 
         entries.push(SnapEntry {
             inode,
@@ -570,7 +607,7 @@ impl TagFs {
                         if avail_tags.contains(basename) {
                             continue;
                         }
-                        self.push_file_entry(&mut entries, basename, state);
+                        self.plan_file_entry(&mut entries, &mut pending, basename, state);
                     }
                 }
             }
@@ -580,32 +617,38 @@ impl TagFs {
                     SpecialKind::Untagged => state.get_untagged_files(),
                 };
                 for basename in sorted_names(&file_set) {
-                    self.push_file_entry(&mut entries, basename, state);
+                    self.plan_file_entry(&mut entries, &mut pending, basename, state);
                 }
             }
             _ => return Err(libc::ENOTDIR.into()),
         }
 
-        Ok(entries)
+        Ok((entries, pending))
     }
 
-    /// Append one file entry.
+    /// Append one file entry and queue its stat for after the lock is dropped.
     ///
     /// A file we know about but cannot stat - deleted or made unreachable
-    /// behind our back - is still listed, with placeholder attributes. We know
+    /// behind our back - keeps the placeholder attributes set here. We know
     /// the name is there, so hiding it would turn a source problem into a
     /// silently short listing. Opening it will fail with the real error.
-    fn push_file_entry(&self, entries: &mut Vec<SnapEntry>, basename: &str, state: &mut FsState) {
+    fn plan_file_entry(
+        &self,
+        entries: &mut Vec<SnapEntry>,
+        pending: &mut Vec<(usize, PathBuf)>,
+        basename: &str,
+        state: &mut FsState,
+    ) {
         let ino = state.inode_table.get_or_alloc_file(basename);
-        let attr = self.file_attr(ino, basename, state).unwrap_or_else(|e| {
-            log::debug!("readdir: cannot stat {:?}: {:?}, listing as placeholder", basename, e);
-            self.placeholder_file_attr(ino)
-        });
+        let Some(entry) = state.files.get(basename) else {
+            return;
+        };
+        pending.push((entries.len(), self.root.join(&entry.ffn)));
         entries.push(SnapEntry {
             inode: ino,
-            kind: attr.kind,
+            kind: FileType::RegularFile,
             name: OsString::from(basename),
-            attr,
+            attr: self.placeholder_file_attr(ino),
         });
     }
 
@@ -636,8 +679,7 @@ impl TagFs {
         if let Some(snap) = self.dir_handles.lock().unwrap().get(&fh) {
             return Ok(Arc::clone(snap));
         }
-        let mut state = self.state.write().unwrap();
-        Ok(Arc::new(self.build_dir_entries(inode, &mut state)?))
+        Ok(Arc::new(self.build_dir_entries(inode)?))
     }
 
     /// Synthetic directory attributes. `size` is the number of files visible
@@ -698,8 +740,14 @@ impl TagFs {
             .get(basename)
             .ok_or_else(|| Errno::from(libc::ENOENT))?;
         let full_path = self.root.join(&entry.ffn);
+        Self::stat_attr(ino, &full_path)
+    }
+
+    /// Attributes of one physical path. Takes no state, so callers holding the
+    /// lock can resolve the path first and stat after releasing it.
+    fn stat_attr(ino: u64, full_path: &Path) -> FuseResult<FileAttr> {
         // Use symlink_metadata (lstat) like Python does
-        let meta = std::fs::symlink_metadata(&full_path)
+        let meta = std::fs::symlink_metadata(full_path)
             .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
 
         let kind = if meta.file_type().is_symlink() {
@@ -1160,9 +1208,7 @@ impl Filesystem for TagFs {
     }
 
     async fn opendir(&self, _req: Request, inode: u64, _flags: u32) -> FuseResult<ReplyOpen> {
-        let mut state = self.state.write().unwrap();
-        let entries = self.build_dir_entries(inode, &mut state)?;
-        drop(state);
+        let entries = self.build_dir_entries(inode)?;
 
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         log::debug!("opendir: inode {} -> fh {} ({} entries)", inode, fh, entries.len());
