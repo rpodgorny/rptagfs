@@ -142,21 +142,29 @@ impl FsState {
     }
 
     /// Return basenames of files matching all the given tags.
+    /// Scans the rarest tag's set, so cost is bounded by the smallest tag,
+    /// not by the first one alphabetically.
     fn get_matching_files(&self, tags: &BTreeSet<String>) -> HashSet<String> {
         if tags.is_empty() {
             return self.files.keys().cloned().collect();
         }
-        let mut tags_iter = tags.iter();
-        let first_tag = tags_iter.next().unwrap();
-        let mut result = self.by_tags.get(first_tag).cloned().unwrap_or_default();
-        for tag in tags_iter {
-            if let Some(tag_files) = self.by_tags.get(tag) {
-                result = result.intersection(tag_files).cloned().collect();
-            } else {
-                return HashSet::new();
+        let mut sets = Vec::with_capacity(tags.len());
+        for tag in tags {
+            match self.by_tags.get(tag) {
+                Some(s) => sets.push(s),
+                None => return HashSet::new(),
             }
         }
-        result
+        let small = sets.iter().enumerate().min_by_key(|(_, s)| s.len()).unwrap().0;
+        sets[small]
+            .iter()
+            .filter(|bn| {
+                sets.iter()
+                    .enumerate()
+                    .all(|(i, s)| i == small || s.contains(*bn))
+            })
+            .cloned()
+            .collect()
     }
 
     /// Determine file type (symlink vs regular) for a file basename.
@@ -557,17 +565,14 @@ impl Filesystem for TagFs {
 
                 // Non-root: check matching files first (files take priority)
                 if !is_root {
-                    let matching_files = state.get_matching_files(parent_tags);
-                    if matching_files.contains(&name_str) {
-                        if let Some(fe) = state.files.get(&name_str) {
-                            if parent_tags.is_subset(&fe.tags) {
-                                drop(state);
-                                let mut state = self.state.write().unwrap();
-                                let ino = state.inode_table.get_or_alloc_file(&name_str);
-                                let attr = self.file_attr(ino, &name_str, &state)?;
-                                log::debug!("lookup: parent={} name={:?} -> file inode {}", parent, name_str, ino);
-                                return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
-                            }
+                    if let Some(fe) = state.files.get(&name_str) {
+                        if parent_tags.is_subset(&fe.tags) {
+                            drop(state);
+                            let mut state = self.state.write().unwrap();
+                            let ino = state.inode_table.get_or_alloc_file(&name_str);
+                            let attr = self.file_attr(ino, &name_str, &state)?;
+                            log::debug!("lookup: parent={} name={:?} -> file inode {}", parent, name_str, ino);
+                            return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
                         }
                     }
                 }
@@ -589,12 +594,14 @@ impl Filesystem for TagFs {
                 Err(libc::ENOENT.into())
             }
             Some(InodeEntry::SpecialDir(ref kind)) => {
-                let file_set = match kind {
-                    SpecialKind::All => state.get_matching_files(&BTreeSet::new()),
-                    SpecialKind::Untagged => state.get_untagged_files(),
+                let found = match kind {
+                    SpecialKind::All => state.files.contains_key(&name_str),
+                    SpecialKind::Untagged => {
+                        state.files.get(&name_str).is_some_and(|e| e.tags.is_empty())
+                    }
                 };
 
-                if file_set.contains(&name_str) {
+                if found {
                     drop(state);
                     let mut state = self.state.write().unwrap();
                     let ino = state.inode_table.get_or_alloc_file(&name_str);
