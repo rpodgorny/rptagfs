@@ -5,10 +5,10 @@ edition = "2021"
 
 [dependencies]
 fuse3 = { version = "0.9", features = ["tokio-runtime", "unprivileged"] }
-tokio = { version = "1", features = ["full"] }
-clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 log = "0.4"
-env_logger = "0.11"
+env_logger = { version = "0.11", default-features = false }
 libc = "0.2"
 futures-util = "0.3"
 bytes = "1"
