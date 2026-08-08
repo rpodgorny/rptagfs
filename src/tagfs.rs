@@ -487,6 +487,12 @@ impl TagFs {
 
     /// Synthetic directory attributes. `size` is the number of files visible
     /// in that directory, i.e. matching its whole tag path.
+    ///
+    /// Known gap: readdir hides a file whose basename equals one of the
+    /// directory's available tags (tags win), but the count below still
+    /// includes it, so size can exceed the listed entries by the number of
+    /// such collisions. Filtering them here would cost a get_avail_tags call
+    /// per directory; not worth it until the collision actually bites.
     fn dir_attr(&self, ino: u64, state: &FsState) -> FileAttr {
         let size = match state.inode_table.get(ino) {
             Some(InodeEntry::Dir(tags)) => state.count_matching_files(tags),
