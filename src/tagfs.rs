@@ -471,6 +471,10 @@ impl FsState {
     }
 }
 
+/// A directory's entries, plus the physical paths still to be stat'ed given
+/// as (index into entries, path).
+type DirPlan = (Vec<SnapEntry>, Vec<(usize, PathBuf)>);
+
 /// One directory entry, held in an open directory's snapshot.
 /// Carries the attributes too, so readdirplus needs no further stat.
 struct SnapEntry {
@@ -480,7 +484,9 @@ struct SnapEntry {
     attr: FileAttr,
 }
 
-pub struct TagFs {
+/// Everything the handlers touch, behind one Arc so a handler body can be
+/// moved onto a blocking thread. See `blocking` for why.
+pub struct Inner {
     root: PathBuf,
     state: RwLock<FsState>,
     /// Entry list per open directory handle, built once in opendir.
@@ -496,9 +502,23 @@ pub struct TagFs {
     next_fh: AtomicU64,
 }
 
+pub struct TagFs {
+    inner: Arc<Inner>,
+}
+
+/// Handlers reach Inner's fields and helpers straight through TagFs.
+impl std::ops::Deref for TagFs {
+    type Target = Inner;
+
+    fn deref(&self) -> &Inner {
+        &self.inner
+    }
+}
+
 impl TagFs {
     pub fn new(root: PathBuf, scan: ScanResult) -> Self {
         Self {
+            inner: Arc::new(Inner {
             root,
             state: RwLock::new(FsState {
                 files: scan.files,
@@ -509,8 +529,37 @@ impl TagFs {
             dir_handles: Mutex::new(HashMap::new()),
             // fuse3 reads fh 0 as "stateless", so hand out handles from 1.
             next_fh: AtomicU64::new(1),
+            }),
         }
     }
+}
+
+/// Run a filesystem handler body on tokio's blocking pool.
+///
+/// Every handler is synchronous top to bottom: the operations a FUSE server
+/// performs - stat, open, pread, rename, fsync - have no non-blocking form on
+/// Linux, and tokio::fs only wraps each individual std::fs call in exactly the
+/// spawn_blocking done here. Running them directly on a runtime worker meant
+/// enough concurrent requests could occupy every worker, leaving nothing to run
+/// the loop that reads from /dev/fuse, which stalls the whole mount. Wrapping
+/// the body once, rather than per syscall, costs one thread handoff per request
+/// instead of one per syscall, and lets the bodies keep using ordinary
+/// synchronous locks.
+async fn blocking<T, F>(f: F) -> FuseResult<T>
+where
+    F: FnOnce() -> FuseResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(e) => {
+            log::error!("blocking task failed: {}", e);
+            Err(libc::EIO.into())
+        }
+    }
+}
+
+impl Inner {
 
     /// Build the full entry list for a directory, in stable order.
     ///
@@ -549,7 +598,7 @@ impl TagFs {
         &self,
         inode: u64,
         state: &mut FsState,
-    ) -> FuseResult<(Vec<SnapEntry>, Vec<(usize, PathBuf)>)> {
+    ) -> FuseResult<DirPlan> {
         let inode_entry = state.inode_table.get(inode).cloned();
         let mut entries = Vec::new();
         let mut pending = Vec::new();
@@ -800,79 +849,84 @@ impl Filesystem for TagFs {
     }
 
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<ReplyEntry> {
-        let name_str = name.to_string_lossy().to_string();
-        let state = self.state.read().unwrap();
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_os_string();
+        blocking(move || {
+            let name_str = name.to_string_lossy().to_string();
+            let state = inner.state.read().unwrap();
 
-        let parent_entry = state.inode_table.get(parent).cloned();
+            let parent_entry = state.inode_table.get(parent).cloned();
 
-        match parent_entry {
-            Some(InodeEntry::Dir(ref parent_tags)) => {
-                let is_root = parent == ROOT_INODE;
+            match parent_entry {
+                Some(InodeEntry::Dir(ref parent_tags)) => {
+                    let is_root = parent == ROOT_INODE;
 
-                // At root, check for special directory names first
-                if is_root {
-                    if name_str == SPECIAL_ALL_NAME {
-                        let attr = self.dir_attr(ALL_INODE, &state);
-                        return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
-                    }
-                    if name_str == SPECIAL_UNTAGGED_NAME {
-                        let attr = self.dir_attr(UNTAGGED_INODE, &state);
-                        return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
-                    }
-                }
-
-                // Non-root: check matching files first (files take priority)
-                if !is_root {
-                    if let Some(fe) = state.files.get(&name_str) {
-                        if parent_tags.is_subset(&fe.tags) {
-                            drop(state);
-                            let mut state = self.state.write().unwrap();
-                            let ino = state.inode_table.get_or_alloc_file(&name_str);
-                            let attr = self.file_attr(ino, &name_str, &state)?;
-                            log::debug!("lookup: parent={} name={:?} -> file inode {}", parent, name_str, ino);
+                    // At root, check for special directory names first
+                    if is_root {
+                        if name_str == SPECIAL_ALL_NAME {
+                            let attr = inner.dir_attr(ALL_INODE, &state);
+                            return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
+                        }
+                        if name_str == SPECIAL_UNTAGGED_NAME {
+                            let attr = inner.dir_attr(UNTAGGED_INODE, &state);
                             return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
                         }
                     }
-                }
 
-                // Check if name is an available tag
-                let avail_tags = state.get_avail_tags(parent_tags);
-                if avail_tags.contains(&name_str) {
-                    let mut child_tags = parent_tags.clone();
-                    child_tags.insert(name_str.clone());
-                    drop(state);
-                    let mut state = self.state.write().unwrap();
-                    let ino = state.inode_table.get_or_alloc_dir(&child_tags);
-                    let attr = self.dir_attr(ino, &state);
-                    log::debug!("lookup: parent={} name={:?} -> dir inode {}", parent, name_str, ino);
-                    return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
-                }
-
-                log::debug!("lookup: parent={} name={:?} -> ENOENT", parent, name_str);
-                Err(libc::ENOENT.into())
-            }
-            Some(InodeEntry::SpecialDir(ref kind)) => {
-                let found = match kind {
-                    SpecialKind::All => state.files.contains_key(&name_str),
-                    SpecialKind::Untagged => {
-                        state.files.get(&name_str).is_some_and(|e| e.tags.is_empty())
+                    // Non-root: check matching files first (files take priority)
+                    if !is_root {
+                        if let Some(fe) = state.files.get(&name_str) {
+                            if parent_tags.is_subset(&fe.tags) {
+                                drop(state);
+                                let mut state = inner.state.write().unwrap();
+                                let ino = state.inode_table.get_or_alloc_file(&name_str);
+                                let attr = inner.file_attr(ino, &name_str, &state)?;
+                                log::debug!("lookup: parent={} name={:?} -> file inode {}", parent, name_str, ino);
+                                return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
+                            }
+                        }
                     }
-                };
 
-                if found {
-                    drop(state);
-                    let mut state = self.state.write().unwrap();
-                    let ino = state.inode_table.get_or_alloc_file(&name_str);
-                    let attr = self.file_attr(ino, &name_str, &state)?;
-                    log::debug!("lookup: parent={} (special) name={:?} -> file inode {}", parent, name_str, ino);
-                    return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
+                    // Check if name is an available tag
+                    let avail_tags = state.get_avail_tags(parent_tags);
+                    if avail_tags.contains(&name_str) {
+                        let mut child_tags = parent_tags.clone();
+                        child_tags.insert(name_str.clone());
+                        drop(state);
+                        let mut state = inner.state.write().unwrap();
+                        let ino = state.inode_table.get_or_alloc_dir(&child_tags);
+                        let attr = inner.dir_attr(ino, &state);
+                        log::debug!("lookup: parent={} name={:?} -> dir inode {}", parent, name_str, ino);
+                        return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
+                    }
+
+                    log::debug!("lookup: parent={} name={:?} -> ENOENT", parent, name_str);
+                    Err(libc::ENOENT.into())
                 }
+                Some(InodeEntry::SpecialDir(ref kind)) => {
+                    let found = match kind {
+                        SpecialKind::All => state.files.contains_key(&name_str),
+                        SpecialKind::Untagged => {
+                            state.files.get(&name_str).is_some_and(|e| e.tags.is_empty())
+                        }
+                    };
 
-                log::debug!("lookup: parent={} (special) name={:?} -> ENOENT", parent, name_str);
-                Err(libc::ENOENT.into())
+                    if found {
+                        drop(state);
+                        let mut state = inner.state.write().unwrap();
+                        let ino = state.inode_table.get_or_alloc_file(&name_str);
+                        let attr = inner.file_attr(ino, &name_str, &state)?;
+                        log::debug!("lookup: parent={} (special) name={:?} -> file inode {}", parent, name_str, ino);
+                        return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
+                    }
+
+                    log::debug!("lookup: parent={} (special) name={:?} -> ENOENT", parent, name_str);
+                    Err(libc::ENOENT.into())
+                }
+                _ => Err(libc::ENOENT.into()),
             }
-            _ => Err(libc::ENOENT.into()),
-        }
+        })
+        .await
     }
 
     async fn getattr(
@@ -882,23 +936,27 @@ impl Filesystem for TagFs {
         _fh: Option<u64>,
         _flags: u32,
     ) -> FuseResult<ReplyAttr> {
-        let state = self.state.read().unwrap();
-        match state.inode_table.get(inode) {
-            Some(InodeEntry::Dir(_)) | Some(InodeEntry::SpecialDir(_)) => {
-                log::debug!("getattr: inode {} -> dir", inode);
-                Ok(ReplyAttr {
-                    ttl: TTL,
-                    attr: self.dir_attr(inode, &state),
-                })
+        let inner = Arc::clone(&self.inner);
+        blocking(move || {
+            let state = inner.state.read().unwrap();
+            match state.inode_table.get(inode) {
+                Some(InodeEntry::Dir(_)) | Some(InodeEntry::SpecialDir(_)) => {
+                    log::debug!("getattr: inode {} -> dir", inode);
+                    Ok(ReplyAttr {
+                        ttl: TTL,
+                        attr: inner.dir_attr(inode, &state),
+                    })
+                }
+                Some(InodeEntry::File(basename)) => {
+                    log::debug!("getattr: inode {} -> file {:?}", inode, basename);
+                    let basename = basename.clone();
+                    let attr = inner.file_attr(inode, &basename, &state)?;
+                    Ok(ReplyAttr { ttl: TTL, attr })
+                }
+                None => Err(libc::ENOENT.into()),
             }
-            Some(InodeEntry::File(basename)) => {
-                log::debug!("getattr: inode {} -> file {:?}", inode, basename);
-                let basename = basename.clone();
-                let attr = self.file_attr(inode, &basename, &state)?;
-                Ok(ReplyAttr { ttl: TTL, attr })
-            }
-            None => Err(libc::ENOENT.into()),
-        }
+        })
+        .await
     }
 
     async fn setattr(
@@ -908,77 +966,81 @@ impl Filesystem for TagFs {
         _fh: Option<u64>,
         set_attr: SetAttr,
     ) -> FuseResult<ReplyAttr> {
-        let state = self.state.read().unwrap();
-        match state.inode_table.get(inode) {
-            Some(InodeEntry::Dir(_)) | Some(InodeEntry::SpecialDir(_)) => {
-                // For directories, return synthetic attrs unchanged
-                Ok(ReplyAttr {
-                    ttl: TTL,
-                    attr: self.dir_attr(inode, &state),
-                })
-            }
-            Some(InodeEntry::File(basename)) => {
-                let basename = basename.clone();
-                let full_path = self.resolve_file_path(&basename, &state)?;
-                drop(state);
-
-                let path_c = std::ffi::CString::new(full_path.as_os_str().as_encoded_bytes())
-                    .map_err(|_| Errno::from(libc::EINVAL))?;
-
-                if let Some(mode) = set_attr.mode {
-                    let ret = unsafe { libc::chmod(path_c.as_ptr(), mode) };
-                    if ret != 0 {
-                        return Err(Errno::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)));
-                    }
+        let inner = Arc::clone(&self.inner);
+        blocking(move || {
+            let state = inner.state.read().unwrap();
+            match state.inode_table.get(inode) {
+                Some(InodeEntry::Dir(_)) | Some(InodeEntry::SpecialDir(_)) => {
+                    // For directories, return synthetic attrs unchanged
+                    Ok(ReplyAttr {
+                        ttl: TTL,
+                        attr: inner.dir_attr(inode, &state),
+                    })
                 }
+                Some(InodeEntry::File(basename)) => {
+                    let basename = basename.clone();
+                    let full_path = inner.resolve_file_path(&basename, &state)?;
+                    drop(state);
 
-                if set_attr.uid.is_some() || set_attr.gid.is_some() {
-                    let uid = set_attr.uid.unwrap_or(u32::MAX);
-                    let gid = set_attr.gid.unwrap_or(u32::MAX);
-                    let ret = unsafe { libc::chown(path_c.as_ptr(), uid, gid) };
-                    if ret != 0 {
-                        return Err(Errno::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)));
-                    }
-                }
+                    let path_c = std::ffi::CString::new(full_path.as_os_str().as_encoded_bytes())
+                        .map_err(|_| Errno::from(libc::EINVAL))?;
 
-                if let Some(size) = set_attr.size {
-                    let ret = unsafe { libc::truncate(path_c.as_ptr(), size as libc::off_t) };
-                    if ret != 0 {
-                        return Err(Errno::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)));
-                    }
-                }
-
-                if set_attr.atime.is_some() || set_attr.mtime.is_some() {
-                    let to_timespec = |ts: Option<Timestamp>| -> libc::timespec {
-                        match ts {
-                            Some(t) => libc::timespec {
-                                tv_sec: t.sec,
-                                tv_nsec: t.nsec as i64,
-                            },
-                            None => libc::timespec {
-                                tv_sec: 0,
-                                tv_nsec: libc::UTIME_OMIT,
-                            },
+                    if let Some(mode) = set_attr.mode {
+                        let ret = unsafe { libc::chmod(path_c.as_ptr(), mode) };
+                        if ret != 0 {
+                            return Err(Errno::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)));
                         }
-                    };
-                    let times = [
-                        to_timespec(set_attr.atime),
-                        to_timespec(set_attr.mtime),
-                    ];
-                    let ret = unsafe {
-                        libc::utimensat(libc::AT_FDCWD, path_c.as_ptr(), times.as_ptr(), 0)
-                    };
-                    if ret != 0 {
-                        return Err(Errno::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)));
                     }
-                }
 
-                let state = self.state.read().unwrap();
-                let attr = self.file_attr(inode, &basename, &state)?;
-                Ok(ReplyAttr { ttl: TTL, attr })
+                    if set_attr.uid.is_some() || set_attr.gid.is_some() {
+                        let uid = set_attr.uid.unwrap_or(u32::MAX);
+                        let gid = set_attr.gid.unwrap_or(u32::MAX);
+                        let ret = unsafe { libc::chown(path_c.as_ptr(), uid, gid) };
+                        if ret != 0 {
+                            return Err(Errno::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)));
+                        }
+                    }
+
+                    if let Some(size) = set_attr.size {
+                        let ret = unsafe { libc::truncate(path_c.as_ptr(), size as libc::off_t) };
+                        if ret != 0 {
+                            return Err(Errno::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)));
+                        }
+                    }
+
+                    if set_attr.atime.is_some() || set_attr.mtime.is_some() {
+                        let to_timespec = |ts: Option<Timestamp>| -> libc::timespec {
+                            match ts {
+                                Some(t) => libc::timespec {
+                                    tv_sec: t.sec,
+                                    tv_nsec: t.nsec as i64,
+                                },
+                                None => libc::timespec {
+                                    tv_sec: 0,
+                                    tv_nsec: libc::UTIME_OMIT,
+                                },
+                            }
+                        };
+                        let times = [
+                            to_timespec(set_attr.atime),
+                            to_timespec(set_attr.mtime),
+                        ];
+                        let ret = unsafe {
+                            libc::utimensat(libc::AT_FDCWD, path_c.as_ptr(), times.as_ptr(), 0)
+                        };
+                        if ret != 0 {
+                            return Err(Errno::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)));
+                        }
+                    }
+
+                    let state = inner.state.read().unwrap();
+                    let attr = inner.file_attr(inode, &basename, &state)?;
+                    Ok(ReplyAttr { ttl: TTL, attr })
+                }
+                None => Err(libc::ENOENT.into()),
             }
-            None => Err(libc::ENOENT.into()),
-        }
+        })
+        .await
     }
 
     async fn readdir(
@@ -988,7 +1050,11 @@ impl Filesystem for TagFs {
         fh: u64,
         offset: i64,
     ) -> FuseResult<ReplyDirectory<impl Stream<Item = FuseResult<DirectoryEntry>> + Send + '_>> {
-        let snap = self.dir_entries(inode, fh)?;
+        // Only the lookup can block, when the kernel reads without a handle of
+        // ours and the list has to be rebuilt. Serving the slice is pure memory,
+        // and the stream must be returned unboxed, so just that part is wrapped.
+        let inner = Arc::clone(&self.inner);
+        let snap = blocking(move || inner.dir_entries(inode, fh)).await?;
         let (start, len) = (offset.max(0) as usize, snap.len());
         log::debug!("readdir: inode {} fh {} offset {} of {}", inode, fh, offset, len);
 
@@ -1015,7 +1081,8 @@ impl Filesystem for TagFs {
         offset: u64,
         _lock_owner: u64,
     ) -> FuseResult<ReplyDirectoryPlus<impl Stream<Item = FuseResult<DirectoryEntryPlus>> + Send + '_>> {
-        let snap = self.dir_entries(parent, fh)?;
+        let inner = Arc::clone(&self.inner);
+        let snap = blocking(move || inner.dir_entries(parent, fh)).await?;
         let (start, len) = (offset as usize, snap.len());
         log::debug!("readdirplus: inode {} fh {} offset {} of {}", parent, fh, offset, len);
 
@@ -1037,34 +1104,38 @@ impl Filesystem for TagFs {
     }
 
     async fn open(&self, _req: Request, inode: u64, flags: u32) -> FuseResult<ReplyOpen> {
-        let state = self.state.read().unwrap();
-        let basename = match state.inode_table.get(inode) {
-            Some(InodeEntry::File(bn)) => bn.clone(),
-            Some(InodeEntry::Dir(_)) | Some(InodeEntry::SpecialDir(_)) => return Err(libc::EISDIR.into()),
-            None => return Err(libc::ENOENT.into()),
-        };
+        let inner = Arc::clone(&self.inner);
+        blocking(move || {
+            let state = inner.state.read().unwrap();
+            let basename = match state.inode_table.get(inode) {
+                Some(InodeEntry::File(bn)) => bn.clone(),
+                Some(InodeEntry::Dir(_)) | Some(InodeEntry::SpecialDir(_)) => return Err(libc::EISDIR.into()),
+                None => return Err(libc::ENOENT.into()),
+            };
 
-        let full_path = self.resolve_file_path(&basename, &state)?;
-        drop(state);
+            let full_path = inner.resolve_file_path(&basename, &state)?;
+            drop(state);
 
-        log::debug!("open: {:?} -> {:?}", basename, full_path);
+            log::debug!("open: {:?} -> {:?}", basename, full_path);
 
-        let path_c = std::ffi::CString::new(full_path.as_os_str().as_encoded_bytes())
-            .map_err(|_| Errno::from(libc::EINVAL))?;
+            let path_c = std::ffi::CString::new(full_path.as_os_str().as_encoded_bytes())
+                .map_err(|_| Errno::from(libc::EINVAL))?;
 
-        // Pass through flags, but strip O_CREAT, O_EXCL, O_NOCTTY
-        let open_flags = (flags as i32) & !(libc::O_CREAT | libc::O_EXCL | libc::O_NOCTTY);
+            // Pass through flags, but strip O_CREAT, O_EXCL, O_NOCTTY
+            let open_flags = (flags as i32) & !(libc::O_CREAT | libc::O_EXCL | libc::O_NOCTTY);
 
-        let fd = unsafe { libc::open(path_c.as_ptr(), open_flags) };
-        if fd < 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
-        }
+            let fd = unsafe { libc::open(path_c.as_ptr(), open_flags) };
+            if fd < 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
+            }
 
-        Ok(ReplyOpen {
-            fh: fd as u64,
-            flags: 0,
+            Ok(ReplyOpen {
+                fh: fd as u64,
+                flags: 0,
+            })
         })
+        .await
     }
 
     async fn read(
@@ -1075,23 +1146,26 @@ impl Filesystem for TagFs {
         offset: u64,
         size: u32,
     ) -> FuseResult<ReplyData> {
-        let mut buf = vec![0u8; size as usize];
-        let n = unsafe {
-            libc::pread(
-                fh as i32,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                size as usize,
-                offset as i64,
-            )
-        };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
-        }
-        buf.truncate(n as usize);
-        Ok(ReplyData {
-            data: Bytes::from(buf),
+        blocking(move || {
+            let mut buf = vec![0u8; size as usize];
+            let n = unsafe {
+                libc::pread(
+                    fh as i32,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    size as usize,
+                    offset as i64,
+                )
+            };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
+            }
+            buf.truncate(n as usize);
+            Ok(ReplyData {
+                data: Bytes::from(buf),
+            })
         })
+        .await
     }
 
     async fn write(
@@ -1104,21 +1178,25 @@ impl Filesystem for TagFs {
         _write_flags: u32,
         _flags: u32,
     ) -> FuseResult<ReplyWrite> {
-        let n = unsafe {
-            libc::pwrite(
-                fh as i32,
-                data.as_ptr() as *const libc::c_void,
-                data.len(),
-                offset as i64,
-            )
-        };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
-        }
-        Ok(ReplyWrite {
-            written: n as u32,
+        let data = data.to_vec();
+        blocking(move || {
+            let n = unsafe {
+                libc::pwrite(
+                    fh as i32,
+                    data.as_ptr() as *const libc::c_void,
+                    data.len(),
+                    offset as i64,
+                )
+            };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
+            }
+            Ok(ReplyWrite {
+                written: n as u32,
+            })
         })
+        .await
     }
 
     async fn release(
@@ -1130,48 +1208,61 @@ impl Filesystem for TagFs {
         _lock_owner: u64,
         _flush: bool,
     ) -> FuseResult<()> {
-        unsafe { libc::close(fh as i32) };
-        Ok(())
+        blocking(move || {
+            unsafe { libc::close(fh as i32) };
+            Ok(())
+        })
+        .await
     }
 
     async fn flush(&self, _req: Request, _inode: u64, fh: u64, _lock_owner: u64) -> FuseResult<()> {
-        let ret = unsafe { libc::fsync(fh as i32) };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
-        }
-        Ok(())
+        blocking(move || {
+            let ret = unsafe { libc::fsync(fh as i32) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn fsync(&self, _req: Request, _inode: u64, fh: u64, datasync: bool) -> FuseResult<()> {
-        let ret = if datasync {
-            unsafe { libc::fdatasync(fh as i32) }
-        } else {
-            unsafe { libc::fsync(fh as i32) }
-        };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
-        }
-        Ok(())
+        blocking(move || {
+            let ret = if datasync {
+                unsafe { libc::fdatasync(fh as i32) }
+            } else {
+                unsafe { libc::fsync(fh as i32) }
+            };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn readlink(&self, _req: Request, inode: u64) -> FuseResult<ReplyData> {
-        let state = self.state.read().unwrap();
-        let basename = match state.inode_table.get(inode) {
-            Some(InodeEntry::File(bn)) => bn.clone(),
-            _ => return Err(libc::EINVAL.into()),
-        };
+        let inner = Arc::clone(&self.inner);
+        blocking(move || {
+            let state = inner.state.read().unwrap();
+            let basename = match state.inode_table.get(inode) {
+                Some(InodeEntry::File(bn)) => bn.clone(),
+                _ => return Err(libc::EINVAL.into()),
+            };
 
-        let full_path = self.resolve_file_path(&basename, &state)?;
-        drop(state);
+            let full_path = inner.resolve_file_path(&basename, &state)?;
+            drop(state);
 
-        log::debug!("readlink: {:?}", basename);
-        let target = std::fs::read_link(&full_path)
-            .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
-        Ok(ReplyData {
-            data: Bytes::from(target.into_os_string().into_encoded_bytes()),
+            log::debug!("readlink: {:?}", basename);
+            let target = std::fs::read_link(&full_path)
+                .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            Ok(ReplyData {
+                data: Bytes::from(target.into_os_string().into_encoded_bytes()),
+            })
         })
+        .await
     }
 
     async fn access(&self, _req: Request, inode: u64, _mask: u32) -> FuseResult<()> {
@@ -1184,36 +1275,44 @@ impl Filesystem for TagFs {
     }
 
     async fn statfs(&self, _req: Request, _inode: u64) -> FuseResult<ReplyStatFs> {
-        let path_bytes = self.root.as_os_str().as_encoded_bytes();
-        let path_c = std::ffi::CString::new(path_bytes)
-            .map_err(|_| Errno::from(libc::EINVAL))?;
+        let inner = Arc::clone(&self.inner);
+        blocking(move || {
+            let path_bytes = inner.root.as_os_str().as_encoded_bytes();
+            let path_c = std::ffi::CString::new(path_bytes)
+                .map_err(|_| Errno::from(libc::EINVAL))?;
 
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        let ret = unsafe { libc::statvfs(path_c.as_ptr(), &mut stat) };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
-        }
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            let ret = unsafe { libc::statvfs(path_c.as_ptr(), &mut stat) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
+            }
 
-        Ok(ReplyStatFs {
-            bsize: stat.f_bsize as u32,
-            frsize: stat.f_frsize as u32,
-            blocks: stat.f_blocks,
-            bfree: stat.f_bfree,
-            bavail: stat.f_bavail,
-            files: stat.f_files,
-            ffree: stat.f_ffree,
-            namelen: stat.f_namemax as u32,
+            Ok(ReplyStatFs {
+                bsize: stat.f_bsize as u32,
+                frsize: stat.f_frsize as u32,
+                blocks: stat.f_blocks,
+                bfree: stat.f_bfree,
+                bavail: stat.f_bavail,
+                files: stat.f_files,
+                ffree: stat.f_ffree,
+                namelen: stat.f_namemax as u32,
+            })
         })
+        .await
     }
 
     async fn opendir(&self, _req: Request, inode: u64, _flags: u32) -> FuseResult<ReplyOpen> {
-        let entries = self.build_dir_entries(inode)?;
+        let inner = Arc::clone(&self.inner);
+        blocking(move || {
+            let entries = inner.build_dir_entries(inode)?;
 
-        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        log::debug!("opendir: inode {} -> fh {} ({} entries)", inode, fh, entries.len());
-        self.dir_handles.lock().unwrap().insert(fh, Arc::new(entries));
-        Ok(ReplyOpen { fh, flags: 0 })
+            let fh = inner.next_fh.fetch_add(1, Ordering::Relaxed);
+            log::debug!("opendir: inode {} -> fh {} ({} entries)", inode, fh, entries.len());
+            inner.dir_handles.lock().unwrap().insert(fh, Arc::new(entries));
+            Ok(ReplyOpen { fh, flags: 0 })
+        })
+        .await
     }
 
     async fn releasedir(
@@ -1229,69 +1328,79 @@ impl Filesystem for TagFs {
     }
 
     async fn unlink(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
-        let name_str = name.to_string_lossy().to_string();
-        log::debug!("unlink: parent={} name={:?}", parent, name_str);
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_os_string();
+        blocking(move || {
+            let name_str = name.to_string_lossy().to_string();
+            log::debug!("unlink: parent={} name={:?}", parent, name_str);
 
-        let mut state = self.state.write().unwrap();
+            let mut state = inner.state.write().unwrap();
 
-        // Verify file exists
-        let entry = state.files.get(&name_str)
-            .ok_or_else(|| Errno::from(libc::ENOENT))?;
-        let ffn = entry.ffn.clone();
-        let tags = entry.tags.clone();
+            // Verify file exists
+            let entry = state.files.get(&name_str)
+                .ok_or_else(|| Errno::from(libc::ENOENT))?;
+            let ffn = entry.ffn.clone();
+            let tags = entry.tags.clone();
 
-        // Physical delete
-        let full_path = self.root.join(&ffn);
-        std::fs::remove_file(&full_path)
-            .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            // Physical delete
+            let full_path = inner.root.join(&ffn);
+            std::fs::remove_file(&full_path)
+                .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
 
-        // Update state
-        state.files.remove(&name_str);
-        for tag in &tags {
-            if let Some(set) = state.by_tags.get_mut(tag) {
-                set.remove(&name_str);
+            // Update state
+            state.files.remove(&name_str);
+            for tag in &tags {
+                if let Some(set) = state.by_tags.get_mut(tag) {
+                    set.remove(&name_str);
+                }
             }
-        }
-        state.inode_table.remove_file(&name_str);
+            state.inode_table.remove_file(&name_str);
 
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn rmdir(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
-        let name_str = name.to_string_lossy().to_string();
-        log::debug!("rmdir: parent={} name={:?}", parent, name_str);
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_os_string();
+        blocking(move || {
+            let name_str = name.to_string_lossy().to_string();
+            log::debug!("rmdir: parent={} name={:?}", parent, name_str);
 
-        let mut state = self.state.write().unwrap();
+            let mut state = inner.state.write().unwrap();
 
-        // Disallow on special dirs
-        if name_str == SPECIAL_ALL_NAME || name_str == SPECIAL_UNTAGGED_NAME {
-            return Err(libc::EPERM.into());
-        }
+            // Disallow on special dirs
+            if name_str == SPECIAL_ALL_NAME || name_str == SPECIAL_UNTAGGED_NAME {
+                return Err(libc::EPERM.into());
+            }
 
-        // Compute child tag set
-        let parent_tags = match state.inode_table.get(parent) {
-            Some(InodeEntry::Dir(tags)) => tags.clone(),
-            _ => return Err(libc::ENOENT.into()),
-        };
-        let mut child_tags = parent_tags;
-        child_tags.insert(name_str.clone());
+            // Compute child tag set
+            let parent_tags = match state.inode_table.get(parent) {
+                Some(InodeEntry::Dir(tags)) => tags.clone(),
+                _ => return Err(libc::ENOENT.into()),
+            };
+            let mut child_tags = parent_tags;
+            child_tags.insert(name_str.clone());
 
-        // Remove physical dirs
-        if let Some(dirs) = state.tagdirs.get(&child_tags) {
-            for dir in dirs.clone() {
-                let full_path = self.root.join(&dir);
-                if full_path.exists() {
-                    std::fs::remove_dir(&full_path)
-                        .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            // Remove physical dirs
+            if let Some(dirs) = state.tagdirs.get(&child_tags) {
+                for dir in dirs.clone() {
+                    let full_path = inner.root.join(&dir);
+                    if full_path.exists() {
+                        std::fs::remove_dir(&full_path)
+                            .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+                    }
                 }
             }
-        }
 
-        // Remove from state
-        state.tagdirs.remove(&child_tags);
-        state.inode_table.remove_dir(&child_tags);
+            // Remove from state
+            state.tagdirs.remove(&child_tags);
+            state.inode_table.remove_dir(&child_tags);
 
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn mkdir(
@@ -1302,35 +1411,40 @@ impl Filesystem for TagFs {
         _mode: u32,
         _umask: u32,
     ) -> FuseResult<ReplyEntry> {
-        let name_str = name.to_string_lossy().to_string();
-        log::debug!("mkdir: parent={} name={:?}", parent, name_str);
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_os_string();
+        blocking(move || {
+            let name_str = name.to_string_lossy().to_string();
+            log::debug!("mkdir: parent={} name={:?}", parent, name_str);
 
-        let mut state = self.state.write().unwrap();
+            let mut state = inner.state.write().unwrap();
 
-        // Disallow inside _all or _untagged
-        match state.inode_table.get(parent) {
-            Some(InodeEntry::SpecialDir(_)) => return Err(libc::EPERM.into()),
-            Some(InodeEntry::Dir(_)) => {}
-            _ => return Err(libc::ENOENT.into()),
-        }
+            // Disallow inside _all or _untagged
+            match state.inode_table.get(parent) {
+                Some(InodeEntry::SpecialDir(_)) => return Err(libc::EPERM.into()),
+                Some(InodeEntry::Dir(_)) => {}
+                _ => return Err(libc::ENOENT.into()),
+            }
 
-        // Compute child tag set
-        let parent_tags = match state.inode_table.get(parent) {
-            Some(InodeEntry::Dir(tags)) => tags.clone(),
-            _ => return Err(libc::ENOENT.into()),
-        };
-        let mut child_tags = parent_tags;
-        child_tags.insert(name_str.clone());
+            // Compute child tag set
+            let parent_tags = match state.inode_table.get(parent) {
+                Some(InodeEntry::Dir(tags)) => tags.clone(),
+                _ => return Err(libc::ENOENT.into()),
+            };
+            let mut child_tags = parent_tags;
+            child_tags.insert(name_str.clone());
 
-        // Create physical directory via helper
-        state.get_dir_for_tags(&child_tags, &self.root)
-            .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            // Create physical directory via helper
+            state.get_dir_for_tags(&child_tags, &inner.root)
+                .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
 
-        // Allocate inode
-        let ino = state.inode_table.get_or_alloc_dir(&child_tags);
-        let attr = self.dir_attr(ino, &state);
+            // Allocate inode
+            let ino = state.inode_table.get_or_alloc_dir(&child_tags);
+            let attr = inner.dir_attr(ino, &state);
 
-        Ok(ReplyEntry { ttl: TTL, attr, generation: 0 })
+            Ok(ReplyEntry { ttl: TTL, attr, generation: 0 })
+        })
+        .await
     }
 
     async fn create(
@@ -1341,66 +1455,71 @@ impl Filesystem for TagFs {
         mode: u32,
         flags: u32,
     ) -> FuseResult<ReplyCreated> {
-        let name_str = name.to_string_lossy().to_string();
-        log::debug!("create: parent={} name={:?} mode={:o} flags={}", parent, name_str, mode, flags);
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_os_string();
+        blocking(move || {
+            let name_str = name.to_string_lossy().to_string();
+            log::debug!("create: parent={} name={:?} mode={:o} flags={}", parent, name_str, mode, flags);
 
-        let mut state = self.state.write().unwrap();
+            let mut state = inner.state.write().unwrap();
 
-        // Determine tags from parent
-        let tags = match state.inode_table.get(parent) {
-            Some(InodeEntry::Dir(t)) => {
-                if parent == ROOT_INODE { BTreeSet::new() } else { t.clone() }
+            // Determine tags from parent
+            let tags = match state.inode_table.get(parent) {
+                Some(InodeEntry::Dir(t)) => {
+                    if parent == ROOT_INODE { BTreeSet::new() } else { t.clone() }
+                }
+                Some(InodeEntry::SpecialDir(SpecialKind::Untagged)) => BTreeSet::new(),
+                Some(InodeEntry::SpecialDir(SpecialKind::All)) => BTreeSet::new(),
+                _ => return Err(libc::ENOENT.into()),
+            };
+
+            // Check for collision
+            if state.files.contains_key(&name_str) {
+                return Err(libc::EEXIST.into());
             }
-            Some(InodeEntry::SpecialDir(SpecialKind::Untagged)) => BTreeSet::new(),
-            Some(InodeEntry::SpecialDir(SpecialKind::All)) => BTreeSet::new(),
-            _ => return Err(libc::ENOENT.into()),
-        };
 
-        // Check for collision
-        if state.files.contains_key(&name_str) {
-            return Err(libc::EEXIST.into());
-        }
+            // Get or create physical directory
+            let dir = state.get_dir_for_tags(&tags, &inner.root)
+                .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
 
-        // Get or create physical directory
-        let dir = state.get_dir_for_tags(&tags, &self.root)
-            .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            // Build physical path
+            let ffn = if dir.as_os_str().is_empty() {
+                PathBuf::from(&name_str)
+            } else {
+                dir.join(&name_str)
+            };
+            let full_path = inner.root.join(&ffn);
 
-        // Build physical path
-        let ffn = if dir.as_os_str().is_empty() {
-            PathBuf::from(&name_str)
-        } else {
-            dir.join(&name_str)
-        };
-        let full_path = self.root.join(&ffn);
+            // Physical create
+            let path_c = std::ffi::CString::new(full_path.as_os_str().as_encoded_bytes())
+                .map_err(|_| Errno::from(libc::EINVAL))?;
+            let open_flags = (flags as i32) | libc::O_CREAT | libc::O_EXCL;
+            let fd = unsafe { libc::open(path_c.as_ptr(), open_flags, mode) };
+            if fd < 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
+            }
 
-        // Physical create
-        let path_c = std::ffi::CString::new(full_path.as_os_str().as_encoded_bytes())
-            .map_err(|_| Errno::from(libc::EINVAL))?;
-        let open_flags = (flags as i32) | libc::O_CREAT | libc::O_EXCL;
-        let fd = unsafe { libc::open(path_c.as_ptr(), open_flags, mode) };
-        if fd < 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
-        }
+            // Update state
+            for tag in &tags {
+                state.by_tags.entry(tag.clone()).or_default().insert(name_str.clone());
+            }
+            state.files.insert(name_str.clone(), FileEntry {
+                ffn,
+                tags,
+            });
+            let ino = state.inode_table.get_or_alloc_file(&name_str);
+            let attr = inner.file_attr(ino, &name_str, &state)?;
 
-        // Update state
-        for tag in &tags {
-            state.by_tags.entry(tag.clone()).or_default().insert(name_str.clone());
-        }
-        state.files.insert(name_str.clone(), FileEntry {
-            ffn,
-            tags,
-        });
-        let ino = state.inode_table.get_or_alloc_file(&name_str);
-        let attr = self.file_attr(ino, &name_str, &state)?;
-
-        Ok(ReplyCreated {
-            ttl: TTL,
-            attr,
-            generation: 0,
-            fh: fd as u64,
-            flags: 0,
+            Ok(ReplyCreated {
+                ttl: TTL,
+                attr,
+                generation: 0,
+                fh: fd as u64,
+                flags: 0,
+            })
         })
+        .await
     }
 
     async fn rename(
@@ -1411,82 +1530,88 @@ impl Filesystem for TagFs {
         new_parent: u64,
         new_name: &OsStr,
     ) -> FuseResult<()> {
-        let name_str = name.to_string_lossy().to_string();
-        let new_name_str = new_name.to_string_lossy().to_string();
-        log::debug!("rename: parent={} name={:?} -> new_parent={} new_name={:?}",
-            parent, name_str, new_parent, new_name_str);
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_os_string();
+        let new_name = new_name.to_os_string();
+        blocking(move || {
+            let name_str = name.to_string_lossy().to_string();
+            let new_name_str = new_name.to_string_lossy().to_string();
+            log::debug!("rename: parent={} name={:?} -> new_parent={} new_name={:?}",
+                parent, name_str, new_parent, new_name_str);
 
-        let mut state = self.state.write().unwrap();
+            let mut state = inner.state.write().unwrap();
 
-        // Resolve parent tag sets
-        let old_tags = match state.inode_table.get(parent) {
-            Some(InodeEntry::Dir(tags)) => {
-                if parent == ROOT_INODE { BTreeSet::new() } else { tags.clone() }
+            // Resolve parent tag sets
+            let old_tags = match state.inode_table.get(parent) {
+                Some(InodeEntry::Dir(tags)) => {
+                    if parent == ROOT_INODE { BTreeSet::new() } else { tags.clone() }
+                }
+                Some(InodeEntry::SpecialDir(SpecialKind::All)) => {
+                    // Use the file's actual tags
+                    if let Some(fe) = state.files.get(&name_str) {
+                        fe.tags.clone()
+                    } else {
+                        BTreeSet::new()
+                    }
+                }
+                Some(InodeEntry::SpecialDir(SpecialKind::Untagged)) => BTreeSet::new(),
+                _ => return Err(libc::ENOENT.into()),
+            };
+
+            let new_tags = match state.inode_table.get(new_parent) {
+                Some(InodeEntry::Dir(tags)) => {
+                    if new_parent == ROOT_INODE { BTreeSet::new() } else { tags.clone() }
+                }
+                Some(InodeEntry::SpecialDir(SpecialKind::All)) => {
+                    // Use the file's actual tags
+                    if let Some(fe) = state.files.get(&name_str) {
+                        fe.tags.clone()
+                    } else {
+                        BTreeSet::new()
+                    }
+                }
+                Some(InodeEntry::SpecialDir(SpecialKind::Untagged)) => BTreeSet::new(),
+                _ => return Err(libc::ENOENT.into()),
+            };
+
+            // Check if name is a tag (directory rename = tag rename)
+            let is_tag = state.by_tags.contains_key(&name_str) && !state.files.contains_key(&name_str);
+            if is_tag {
+                state.rename_tag(&name_str, &new_name_str, &inner.root)
+                    .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+                return Ok(());
             }
-            Some(InodeEntry::SpecialDir(SpecialKind::All)) => {
-                // Use the file's actual tags
-                if let Some(fe) = state.files.get(&name_str) {
-                    fe.tags.clone()
-                } else {
-                    BTreeSet::new()
+
+            // File rename/retag
+            if !state.files.contains_key(&name_str) {
+                return Err(libc::ENOENT.into());
+            }
+
+            if name_str != new_name_str {
+                // Basename changed: rename file first
+                state.rename_file(&name_str, &new_name_str, &inner.root)
+                    .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+
+                // Then handle tag changes on the new basename
+                let tags_to_add: BTreeSet<String> = new_tags.difference(&old_tags).cloned().collect();
+                let tags_to_remove: BTreeSet<String> = old_tags.difference(&new_tags).cloned().collect();
+                if !tags_to_add.is_empty() || !tags_to_remove.is_empty() {
+                    state.add_remove_tags(&new_name_str, &tags_to_add, &tags_to_remove, &inner.root)
+                        .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+                }
+            } else {
+                // Same basename: just add/remove tags
+                let tags_to_add: BTreeSet<String> = new_tags.difference(&old_tags).cloned().collect();
+                let tags_to_remove: BTreeSet<String> = old_tags.difference(&new_tags).cloned().collect();
+                if !tags_to_add.is_empty() || !tags_to_remove.is_empty() {
+                    state.add_remove_tags(&name_str, &tags_to_add, &tags_to_remove, &inner.root)
+                        .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
                 }
             }
-            Some(InodeEntry::SpecialDir(SpecialKind::Untagged)) => BTreeSet::new(),
-            _ => return Err(libc::ENOENT.into()),
-        };
 
-        let new_tags = match state.inode_table.get(new_parent) {
-            Some(InodeEntry::Dir(tags)) => {
-                if new_parent == ROOT_INODE { BTreeSet::new() } else { tags.clone() }
-            }
-            Some(InodeEntry::SpecialDir(SpecialKind::All)) => {
-                // Use the file's actual tags
-                if let Some(fe) = state.files.get(&name_str) {
-                    fe.tags.clone()
-                } else {
-                    BTreeSet::new()
-                }
-            }
-            Some(InodeEntry::SpecialDir(SpecialKind::Untagged)) => BTreeSet::new(),
-            _ => return Err(libc::ENOENT.into()),
-        };
-
-        // Check if name is a tag (directory rename = tag rename)
-        let is_tag = state.by_tags.contains_key(&name_str) && !state.files.contains_key(&name_str);
-        if is_tag {
-            state.rename_tag(&name_str, &new_name_str, &self.root)
-                .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
-            return Ok(());
-        }
-
-        // File rename/retag
-        if !state.files.contains_key(&name_str) {
-            return Err(libc::ENOENT.into());
-        }
-
-        if name_str != new_name_str {
-            // Basename changed: rename file first
-            state.rename_file(&name_str, &new_name_str, &self.root)
-                .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
-
-            // Then handle tag changes on the new basename
-            let tags_to_add: BTreeSet<String> = new_tags.difference(&old_tags).cloned().collect();
-            let tags_to_remove: BTreeSet<String> = old_tags.difference(&new_tags).cloned().collect();
-            if !tags_to_add.is_empty() || !tags_to_remove.is_empty() {
-                state.add_remove_tags(&new_name_str, &tags_to_add, &tags_to_remove, &self.root)
-                    .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
-            }
-        } else {
-            // Same basename: just add/remove tags
-            let tags_to_add: BTreeSet<String> = new_tags.difference(&old_tags).cloned().collect();
-            let tags_to_remove: BTreeSet<String> = old_tags.difference(&new_tags).cloned().collect();
-            if !tags_to_add.is_empty() || !tags_to_remove.is_empty() {
-                state.add_remove_tags(&name_str, &tags_to_add, &tags_to_remove, &self.root)
-                    .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
-            }
-        }
-
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 }
 
