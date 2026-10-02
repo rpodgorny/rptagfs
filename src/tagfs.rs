@@ -543,7 +543,7 @@ impl FsState {
         self.by_tags.insert(new_tag.to_string(), file_set);
 
         // Update files: replace tag in tags set and ffn
-        for (_bn, entry) in self.files.iter_mut() {
+        for entry in self.files.values_mut() {
             if entry.tags.contains(old_tag) {
                 entry.tags.remove(old_tag);
                 entry.tags.insert(new_tag.to_string());
