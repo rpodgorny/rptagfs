@@ -72,8 +72,10 @@ impl InodeTable {
         // Pre-register special directory inodes
         tbl.inodes
             .insert(ALL_INODE, InodeEntry::SpecialDir(SpecialKind::All));
-        tbl.inodes
-            .insert(UNTAGGED_INODE, InodeEntry::SpecialDir(SpecialKind::Untagged));
+        tbl.inodes.insert(
+            UNTAGGED_INODE,
+            InodeEntry::SpecialDir(SpecialKind::Untagged),
+        );
         tbl
     }
 
@@ -174,7 +176,10 @@ impl FsState {
         self.tag_index.clear();
         for key in self.tagdirs.keys() {
             for tag in key {
-                self.tag_index.entry(tag.clone()).or_default().insert(key.clone());
+                self.tag_index
+                    .entry(tag.clone())
+                    .or_default()
+                    .insert(key.clone());
             }
         }
     }
@@ -182,7 +187,10 @@ impl FsState {
     /// Record a physical directory for a tag set, keeping tag_index in step.
     fn add_tagdir(&mut self, key: BTreeSet<String>, path: PathBuf) {
         for tag in &key {
-            self.tag_index.entry(tag.clone()).or_default().insert(key.clone());
+            self.tag_index
+                .entry(tag.clone())
+                .or_default()
+                .insert(key.clone());
         }
         self.tagdirs.entry(key).or_default().insert(path);
     }
@@ -251,7 +259,9 @@ impl FsState {
     }
 
     fn in_all(sets: &[&HashSet<String>], small: usize, bn: &str) -> bool {
-        sets.iter().enumerate().all(|(i, s)| i == small || s.contains(bn))
+        sets.iter()
+            .enumerate()
+            .all(|(i, s)| i == small || s.contains(bn))
     }
 
     /// Return basenames of files matching all the given tags.
@@ -291,7 +301,11 @@ impl FsState {
 
     /// Get or create a physical directory for a tag set.
     /// Returns the relative path to the directory.
-    fn get_dir_for_tags(&mut self, tags: &BTreeSet<String>, root: &Path) -> std::io::Result<PathBuf> {
+    fn get_dir_for_tags(
+        &mut self,
+        tags: &BTreeSet<String>,
+        root: &Path,
+    ) -> std::io::Result<PathBuf> {
         let key = tags.clone();
 
         // If tagdirs already has this key, return the lexicographically first path
@@ -332,7 +346,9 @@ impl FsState {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
-        let entry = self.files.get(old_bn)
+        let entry = self
+            .files
+            .get(old_bn)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
         let old_ffn = entry.ffn.clone();
         let tags = entry.tags.clone();
@@ -386,7 +402,9 @@ impl FsState {
         tags_to_remove: &BTreeSet<String>,
         root: &Path,
     ) -> std::io::Result<()> {
-        let entry = self.files.get(bn)
+        let entry = self
+            .files
+            .get(bn)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
         let old_ffn = entry.ffn.clone();
         let old_tags = entry.tags.clone();
@@ -429,7 +447,10 @@ impl FsState {
 
         // Update by_tags: add
         for tag in tags_to_add {
-            self.by_tags.entry(tag.clone()).or_default().insert(bn.to_string());
+            self.by_tags
+                .entry(tag.clone())
+                .or_default()
+                .insert(bn.to_string());
         }
         // Update by_tags: remove
         for tag in tags_to_remove {
@@ -447,7 +468,11 @@ impl FsState {
             .components()
             .map(|c| {
                 let s = c.as_os_str().to_string_lossy().to_string();
-                if s == old_tag { new_tag.to_string() } else { s }
+                if s == old_tag {
+                    new_tag.to_string()
+                } else {
+                    s
+                }
             })
             .collect();
         if components.is_empty() {
@@ -481,9 +506,8 @@ impl FsState {
                         let s = component.as_os_str().to_string_lossy();
                         prefix.push(component);
                         if s == old_tag {
-                            let mut new_prefix = prefix.parent()
-                                .map(|p| p.to_path_buf())
-                                .unwrap_or_default();
+                            let mut new_prefix =
+                                prefix.parent().map(|p| p.to_path_buf()).unwrap_or_default();
                             new_prefix.push(new_tag);
                             rename_points.insert((prefix.clone(), new_prefix));
                             break;
@@ -511,8 +535,7 @@ impl FsState {
         }
 
         // Update tagdirs: replace old_tag with new_tag in keys and paths
-        let old_tagdirs: Vec<(BTreeSet<String>, HashSet<PathBuf>)> =
-            self.tagdirs.drain().collect();
+        let old_tagdirs: Vec<(BTreeSet<String>, HashSet<PathBuf>)> = self.tagdirs.drain().collect();
         for (mut tag_set, paths) in old_tagdirs {
             if tag_set.contains(old_tag) {
                 tag_set.remove(old_tag);
@@ -628,11 +651,7 @@ impl TagFs {
     /// Returns the entries plus the physical paths still to be stat'ed, as
     /// (index into entries, path). File entries come back holding placeholder
     /// attributes, which is also what they keep if the stat later fails.
-    fn plan_dir_entries(
-        &self,
-        inode: u64,
-        state: &mut FsState,
-    ) -> FuseResult<DirPlan> {
+    fn plan_dir_entries(&self, inode: u64, state: &mut FsState) -> FuseResult<DirPlan> {
         let inode_entry = state.inode_table.get(inode).cloned();
         let mut entries = Vec::new();
         let mut pending = Vec::new();
@@ -867,7 +886,6 @@ impl TagFs {
             .ok_or_else(|| Errno::from(libc::ENOENT))?;
         Ok(self.root.join(&entry.ffn))
     }
-
 }
 
 impl Filesystem for TagFs {
@@ -897,11 +915,19 @@ impl Filesystem for TagFs {
                     if is_root {
                         if name_str == SPECIAL_ALL_NAME {
                             let attr = self.dir_attr(ALL_INODE, &state);
-                            return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
+                            return Ok(ReplyEntry {
+                                ttl: TTL,
+                                attr,
+                                generation: 0,
+                            });
                         }
                         if name_str == SPECIAL_UNTAGGED_NAME {
                             let attr = self.dir_attr(UNTAGGED_INODE, &state);
-                            return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
+                            return Ok(ReplyEntry {
+                                ttl: TTL,
+                                attr,
+                                generation: 0,
+                            });
                         }
                     }
 
@@ -913,8 +939,17 @@ impl Filesystem for TagFs {
                                 let mut state = self.state.write().unwrap();
                                 let ino = state.inode_table.get_or_alloc_file(&name_str);
                                 let attr = self.file_attr(ino, &name_str, &state)?;
-                                log::debug!("lookup: parent={} name={:?} -> file inode {}", parent, name_str, ino);
-                                return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
+                                log::debug!(
+                                    "lookup: parent={} name={:?} -> file inode {}",
+                                    parent,
+                                    name_str,
+                                    ino
+                                );
+                                return Ok(ReplyEntry {
+                                    ttl: TTL,
+                                    attr,
+                                    generation: 0,
+                                });
                             }
                         }
                     }
@@ -928,8 +963,17 @@ impl Filesystem for TagFs {
                         let mut state = self.state.write().unwrap();
                         let ino = state.inode_table.get_or_alloc_dir(&child_tags);
                         let attr = self.dir_attr(ino, &state);
-                        log::debug!("lookup: parent={} name={:?} -> dir inode {}", parent, name_str, ino);
-                        return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
+                        log::debug!(
+                            "lookup: parent={} name={:?} -> dir inode {}",
+                            parent,
+                            name_str,
+                            ino
+                        );
+                        return Ok(ReplyEntry {
+                            ttl: TTL,
+                            attr,
+                            generation: 0,
+                        });
                     }
 
                     log::debug!("lookup: parent={} name={:?} -> ENOENT", parent, name_str);
@@ -938,9 +982,10 @@ impl Filesystem for TagFs {
                 Some(InodeEntry::SpecialDir(ref kind)) => {
                     let found = match kind {
                         SpecialKind::All => state.files.contains_key(&name_str),
-                        SpecialKind::Untagged => {
-                            state.files.get(&name_str).is_some_and(|e| e.tags.is_empty())
-                        }
+                        SpecialKind::Untagged => state
+                            .files
+                            .get(&name_str)
+                            .is_some_and(|e| e.tags.is_empty()),
                     };
 
                     if found {
@@ -948,11 +993,24 @@ impl Filesystem for TagFs {
                         let mut state = self.state.write().unwrap();
                         let ino = state.inode_table.get_or_alloc_file(&name_str);
                         let attr = self.file_attr(ino, &name_str, &state)?;
-                        log::debug!("lookup: parent={} (special) name={:?} -> file inode {}", parent, name_str, ino);
-                        return Ok(ReplyEntry { ttl: TTL, attr, generation: 0 });
+                        log::debug!(
+                            "lookup: parent={} (special) name={:?} -> file inode {}",
+                            parent,
+                            name_str,
+                            ino
+                        );
+                        return Ok(ReplyEntry {
+                            ttl: TTL,
+                            attr,
+                            generation: 0,
+                        });
                     }
 
-                    log::debug!("lookup: parent={} (special) name={:?} -> ENOENT", parent, name_str);
+                    log::debug!(
+                        "lookup: parent={} (special) name={:?} -> ENOENT",
+                        parent,
+                        name_str
+                    );
                     Err(libc::ENOENT.into())
                 }
                 _ => Err(libc::ENOENT.into()),
@@ -1016,7 +1074,11 @@ impl Filesystem for TagFs {
                     if let Some(mode) = set_attr.mode {
                         let ret = unsafe { libc::chmod(path_c.as_ptr(), mode) };
                         if ret != 0 {
-                            return Err(Errno::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)));
+                            return Err(Errno::from(
+                                std::io::Error::last_os_error()
+                                    .raw_os_error()
+                                    .unwrap_or(libc::EIO),
+                            ));
                         }
                     }
 
@@ -1025,14 +1087,22 @@ impl Filesystem for TagFs {
                         let gid = set_attr.gid.unwrap_or(u32::MAX);
                         let ret = unsafe { libc::chown(path_c.as_ptr(), uid, gid) };
                         if ret != 0 {
-                            return Err(Errno::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)));
+                            return Err(Errno::from(
+                                std::io::Error::last_os_error()
+                                    .raw_os_error()
+                                    .unwrap_or(libc::EIO),
+                            ));
                         }
                     }
 
                     if let Some(size) = set_attr.size {
                         let ret = unsafe { libc::truncate(path_c.as_ptr(), size as libc::off_t) };
                         if ret != 0 {
-                            return Err(Errno::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)));
+                            return Err(Errno::from(
+                                std::io::Error::last_os_error()
+                                    .raw_os_error()
+                                    .unwrap_or(libc::EIO),
+                            ));
                         }
                     }
 
@@ -1049,15 +1119,16 @@ impl Filesystem for TagFs {
                                 },
                             }
                         };
-                        let times = [
-                            to_timespec(set_attr.atime),
-                            to_timespec(set_attr.mtime),
-                        ];
+                        let times = [to_timespec(set_attr.atime), to_timespec(set_attr.mtime)];
                         let ret = unsafe {
                             libc::utimensat(libc::AT_FDCWD, path_c.as_ptr(), times.as_ptr(), 0)
                         };
                         if ret != 0 {
-                            return Err(Errno::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)));
+                            return Err(Errno::from(
+                                std::io::Error::last_os_error()
+                                    .raw_os_error()
+                                    .unwrap_or(libc::EIO),
+                            ));
                         }
                     }
 
@@ -1076,11 +1147,18 @@ impl Filesystem for TagFs {
         inode: u64,
         fh: u64,
         offset: i64,
-    ) -> FuseResult<ReplyDirectory<impl Stream<Item = FuseResult<DirectoryEntry>> + Send + '_>> {
+    ) -> FuseResult<ReplyDirectory<impl Stream<Item = FuseResult<DirectoryEntry>> + Send + '_>>
+    {
         // Serving a page is pure memory; only the rebuild path can block.
         let snap = block_in_place(|| self.dir_entries(inode, fh))?;
         let (start, len) = (offset.max(0) as usize, snap.len());
-        log::debug!("readdir: inode {} fh {} offset {} of {}", inode, fh, offset, len);
+        log::debug!(
+            "readdir: inode {} fh {} offset {} of {}",
+            inode,
+            fh,
+            offset,
+            len
+        );
 
         // Entries are cloned as the consumer pulls them, so serving a page
         // costs the page, not the whole directory.
@@ -1104,10 +1182,18 @@ impl Filesystem for TagFs {
         fh: u64,
         offset: u64,
         _lock_owner: u64,
-    ) -> FuseResult<ReplyDirectoryPlus<impl Stream<Item = FuseResult<DirectoryEntryPlus>> + Send + '_>> {
+    ) -> FuseResult<
+        ReplyDirectoryPlus<impl Stream<Item = FuseResult<DirectoryEntryPlus>> + Send + '_>,
+    > {
         let snap = block_in_place(|| self.dir_entries(parent, fh))?;
         let (start, len) = (offset as usize, snap.len());
-        log::debug!("readdirplus: inode {} fh {} offset {} of {}", parent, fh, offset, len);
+        log::debug!(
+            "readdirplus: inode {} fh {} offset {} of {}",
+            parent,
+            fh,
+            offset,
+            len
+        );
 
         Ok(ReplyDirectoryPlus {
             entries: stream::iter(start..len).map(move |i| {
@@ -1131,7 +1217,9 @@ impl Filesystem for TagFs {
             let state = self.state.read().unwrap();
             let basename = match state.inode_table.get(inode) {
                 Some(InodeEntry::File(bn)) => bn.clone(),
-                Some(InodeEntry::Dir(_)) | Some(InodeEntry::SpecialDir(_)) => return Err(libc::EISDIR.into()),
+                Some(InodeEntry::Dir(_)) | Some(InodeEntry::SpecialDir(_)) => {
+                    return Err(libc::EISDIR.into())
+                }
                 None => return Err(libc::ENOENT.into()),
             };
 
@@ -1211,9 +1299,7 @@ impl Filesystem for TagFs {
                 let err = std::io::Error::last_os_error();
                 return Err(Errno::from(err.raw_os_error().unwrap_or(libc::EIO)));
             }
-            Ok(ReplyWrite {
-                written: n as u32,
-            })
+            Ok(ReplyWrite { written: n as u32 })
         })
     }
 
@@ -1290,8 +1376,8 @@ impl Filesystem for TagFs {
     async fn statfs(&self, _req: Request, _inode: u64) -> FuseResult<ReplyStatFs> {
         block_in_place(|| {
             let path_bytes = self.root.as_os_str().as_encoded_bytes();
-            let path_c = std::ffi::CString::new(path_bytes)
-                .map_err(|_| Errno::from(libc::EINVAL))?;
+            let path_c =
+                std::ffi::CString::new(path_bytes).map_err(|_| Errno::from(libc::EINVAL))?;
 
             let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
             let ret = unsafe { libc::statvfs(path_c.as_ptr(), &mut stat) };
@@ -1318,19 +1404,21 @@ impl Filesystem for TagFs {
             let entries = self.build_dir_entries(inode)?;
 
             let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-            log::debug!("opendir: inode {} -> fh {} ({} entries)", inode, fh, entries.len());
-            self.dir_handles.lock().unwrap().insert(fh, Arc::new(entries));
+            log::debug!(
+                "opendir: inode {} -> fh {} ({} entries)",
+                inode,
+                fh,
+                entries.len()
+            );
+            self.dir_handles
+                .lock()
+                .unwrap()
+                .insert(fh, Arc::new(entries));
             Ok(ReplyOpen { fh, flags: 0 })
         })
     }
 
-    async fn releasedir(
-        &self,
-        _req: Request,
-        _inode: u64,
-        fh: u64,
-        _flags: u32,
-    ) -> FuseResult<()> {
+    async fn releasedir(&self, _req: Request, _inode: u64, fh: u64, _flags: u32) -> FuseResult<()> {
         self.dir_handles.lock().unwrap().remove(&fh);
         log::debug!("releasedir: fh {}", fh);
         Ok(())
@@ -1344,7 +1432,9 @@ impl Filesystem for TagFs {
             let mut state = self.state.write().unwrap();
 
             // Verify file exists
-            let entry = state.files.get(&name_str)
+            let entry = state
+                .files
+                .get(&name_str)
                 .ok_or_else(|| Errno::from(libc::ENOENT))?;
             let ffn = entry.ffn.clone();
             let tags = entry.tags.clone();
@@ -1436,14 +1526,19 @@ impl Filesystem for TagFs {
             child_tags.insert(name_str.clone());
 
             // Create physical directory via helper
-            state.get_dir_for_tags(&child_tags, &self.root)
+            state
+                .get_dir_for_tags(&child_tags, &self.root)
                 .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
 
             // Allocate inode
             let ino = state.inode_table.get_or_alloc_dir(&child_tags);
             let attr = self.dir_attr(ino, &state);
 
-            Ok(ReplyEntry { ttl: TTL, attr, generation: 0 })
+            Ok(ReplyEntry {
+                ttl: TTL,
+                attr,
+                generation: 0,
+            })
         })
     }
 
@@ -1457,14 +1552,24 @@ impl Filesystem for TagFs {
     ) -> FuseResult<ReplyCreated> {
         block_in_place(|| {
             let name_str = name.to_string_lossy().to_string();
-            log::debug!("create: parent={} name={:?} mode={:o} flags={}", parent, name_str, mode, flags);
+            log::debug!(
+                "create: parent={} name={:?} mode={:o} flags={}",
+                parent,
+                name_str,
+                mode,
+                flags
+            );
 
             let mut state = self.state.write().unwrap();
 
             // Determine tags from parent
             let tags = match state.inode_table.get(parent) {
                 Some(InodeEntry::Dir(t)) => {
-                    if parent == ROOT_INODE { BTreeSet::new() } else { t.clone() }
+                    if parent == ROOT_INODE {
+                        BTreeSet::new()
+                    } else {
+                        t.clone()
+                    }
                 }
                 Some(InodeEntry::SpecialDir(SpecialKind::Untagged)) => BTreeSet::new(),
                 Some(InodeEntry::SpecialDir(SpecialKind::All)) => BTreeSet::new(),
@@ -1477,7 +1582,8 @@ impl Filesystem for TagFs {
             }
 
             // Get or create physical directory
-            let dir = state.get_dir_for_tags(&tags, &self.root)
+            let dir = state
+                .get_dir_for_tags(&tags, &self.root)
                 .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
 
             // Build physical path
@@ -1500,12 +1606,15 @@ impl Filesystem for TagFs {
 
             // Update state
             for tag in &tags {
-                state.by_tags.entry(tag.clone()).or_default().insert(name_str.clone());
+                state
+                    .by_tags
+                    .entry(tag.clone())
+                    .or_default()
+                    .insert(name_str.clone());
             }
-            state.files.insert(name_str.clone(), FileEntry {
-                ffn,
-                tags,
-            });
+            state
+                .files
+                .insert(name_str.clone(), FileEntry { ffn, tags });
             let ino = state.inode_table.get_or_alloc_file(&name_str);
             let attr = self.file_attr(ino, &name_str, &state)?;
 
@@ -1530,15 +1639,24 @@ impl Filesystem for TagFs {
         block_in_place(|| {
             let name_str = name.to_string_lossy().to_string();
             let new_name_str = new_name.to_string_lossy().to_string();
-            log::debug!("rename: parent={} name={:?} -> new_parent={} new_name={:?}",
-                parent, name_str, new_parent, new_name_str);
+            log::debug!(
+                "rename: parent={} name={:?} -> new_parent={} new_name={:?}",
+                parent,
+                name_str,
+                new_parent,
+                new_name_str
+            );
 
             let mut state = self.state.write().unwrap();
 
             // Resolve parent tag sets
             let old_tags = match state.inode_table.get(parent) {
                 Some(InodeEntry::Dir(tags)) => {
-                    if parent == ROOT_INODE { BTreeSet::new() } else { tags.clone() }
+                    if parent == ROOT_INODE {
+                        BTreeSet::new()
+                    } else {
+                        tags.clone()
+                    }
                 }
                 Some(InodeEntry::SpecialDir(SpecialKind::All)) => {
                     // Use the file's actual tags
@@ -1554,7 +1672,11 @@ impl Filesystem for TagFs {
 
             let new_tags = match state.inode_table.get(new_parent) {
                 Some(InodeEntry::Dir(tags)) => {
-                    if new_parent == ROOT_INODE { BTreeSet::new() } else { tags.clone() }
+                    if new_parent == ROOT_INODE {
+                        BTreeSet::new()
+                    } else {
+                        tags.clone()
+                    }
                 }
                 Some(InodeEntry::SpecialDir(SpecialKind::All)) => {
                     // Use the file's actual tags
@@ -1569,9 +1691,11 @@ impl Filesystem for TagFs {
             };
 
             // Check if name is a tag (directory rename = tag rename)
-            let is_tag = state.by_tags.contains_key(&name_str) && !state.files.contains_key(&name_str);
+            let is_tag =
+                state.by_tags.contains_key(&name_str) && !state.files.contains_key(&name_str);
             if is_tag {
-                state.rename_tag(&name_str, &new_name_str, &self.root)
+                state
+                    .rename_tag(&name_str, &new_name_str, &self.root)
                     .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
                 return Ok(());
             }
@@ -1583,22 +1707,29 @@ impl Filesystem for TagFs {
 
             if name_str != new_name_str {
                 // Basename changed: rename file first
-                state.rename_file(&name_str, &new_name_str, &self.root)
+                state
+                    .rename_file(&name_str, &new_name_str, &self.root)
                     .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
 
                 // Then handle tag changes on the new basename
-                let tags_to_add: BTreeSet<String> = new_tags.difference(&old_tags).cloned().collect();
-                let tags_to_remove: BTreeSet<String> = old_tags.difference(&new_tags).cloned().collect();
+                let tags_to_add: BTreeSet<String> =
+                    new_tags.difference(&old_tags).cloned().collect();
+                let tags_to_remove: BTreeSet<String> =
+                    old_tags.difference(&new_tags).cloned().collect();
                 if !tags_to_add.is_empty() || !tags_to_remove.is_empty() {
-                    state.add_remove_tags(&new_name_str, &tags_to_add, &tags_to_remove, &self.root)
+                    state
+                        .add_remove_tags(&new_name_str, &tags_to_add, &tags_to_remove, &self.root)
                         .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
                 }
             } else {
                 // Same basename: just add/remove tags
-                let tags_to_add: BTreeSet<String> = new_tags.difference(&old_tags).cloned().collect();
-                let tags_to_remove: BTreeSet<String> = old_tags.difference(&new_tags).cloned().collect();
+                let tags_to_add: BTreeSet<String> =
+                    new_tags.difference(&old_tags).cloned().collect();
+                let tags_to_remove: BTreeSet<String> =
+                    old_tags.difference(&new_tags).cloned().collect();
                 if !tags_to_add.is_empty() || !tags_to_remove.is_empty() {
-                    state.add_remove_tags(&name_str, &tags_to_add, &tags_to_remove, &self.root)
+                    state
+                        .add_remove_tags(&name_str, &tags_to_add, &tags_to_remove, &self.root)
                         .map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
                 }
             }
@@ -1731,19 +1862,22 @@ mod tests {
     async fn readdir_paged(fs: &TagFs, inode: u64, page: usize) -> Vec<String> {
         use futures_util::StreamExt;
 
-        let req = Request { unique: 0, uid: 0, gid: 0, pid: 0 };
+        let req = Request {
+            unique: 0,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
         let mut names = Vec::new();
         let mut offset: i64 = 0;
         // Bound the loop so a paging bug fails the assert rather than hanging.
         for _ in 0..1000 {
             let reply = fs.readdir(req, inode, 0, offset).await.unwrap();
-            let batch: Vec<DirectoryEntry> = reply
-                .entries
-                .take(page)
-                .map(|e| e.unwrap())
-                .collect()
-                .await;
-            let Some(last) = batch.last() else { return names };
+            let batch: Vec<DirectoryEntry> =
+                reply.entries.take(page).map(|e| e.unwrap()).collect().await;
+            let Some(last) = batch.last() else {
+                return names;
+            };
             offset = last.offset;
             names.extend(batch.iter().map(|e| e.name.to_string_lossy().to_string()));
         }
@@ -1754,7 +1888,12 @@ mod tests {
     async fn readdir_entries(fs: &TagFs, inode: u64) -> Vec<DirectoryEntry> {
         use futures_util::StreamExt;
 
-        let req = Request { unique: 0, uid: 0, gid: 0, pid: 0 };
+        let req = Request {
+            unique: 0,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
         fs.readdir(req, inode, 0, 0)
             .await
             .unwrap()
@@ -1809,7 +1948,12 @@ mod tests {
         write_test_layout(dir.path());
         let scan = crate::scanner::scan_tree(dir.path(), false);
         let fs = TagFs::new(dir.path().to_path_buf(), scan);
-        let req = Request { unique: 0, uid: 0, gid: 0, pid: 0 };
+        let req = Request {
+            unique: 0,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
 
         let fh = fs.opendir(req, ALL_INODE, 0).await.unwrap().fh;
         assert_ne!(fh, 0, "fh 0 means stateless to fuse3");
@@ -1916,10 +2060,7 @@ mod tests {
     #[test]
     fn avail_tags_full() {
         let state = make_test_state();
-        let tags = state.get_avail_tags(&BTreeSet::from([
-            "music".to_string(),
-            "rock".to_string(),
-        ]));
+        let tags = state.get_avail_tags(&BTreeSet::from(["music".to_string(), "rock".to_string()]));
         assert!(tags.is_empty());
     }
 
@@ -1962,10 +2103,8 @@ mod tests {
     #[test]
     fn matching_files_two_tags() {
         let state = make_test_state();
-        let files = state.get_matching_files(&BTreeSet::from([
-            "music".to_string(),
-            "rock".to_string(),
-        ]));
+        let files =
+            state.get_matching_files(&BTreeSet::from(["music".to_string(), "rock".to_string()]));
         assert_eq!(files.len(), 1);
         assert!(files.contains("heavy.mp3"));
     }
@@ -2106,8 +2245,10 @@ mod tests {
             },
         );
 
-        let all_tags: BTreeSet<String> =
-            ["a", "b", "c", "d", "e"].iter().map(|s| s.to_string()).collect();
+        let all_tags: BTreeSet<String> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         let mut tagdirs: HashMap<BTreeSet<String>, HashSet<PathBuf>> = HashMap::new();
         tagdirs
@@ -2301,13 +2442,22 @@ mod tests {
         // Physical file moved
         assert!(!root.join("music/song.mp3").exists());
         assert!(root.join("music/track.mp3").exists());
-        assert_eq!(fs::read_to_string(root.join("music/track.mp3")).unwrap(), "song data");
+        assert_eq!(
+            fs::read_to_string(root.join("music/track.mp3")).unwrap(),
+            "song data"
+        );
 
         // State updated
         assert!(!state.files.contains_key("song.mp3"));
         assert!(state.files.contains_key("track.mp3"));
-        assert_eq!(state.files["track.mp3"].ffn, PathBuf::from("music/track.mp3"));
-        assert_eq!(state.files["track.mp3"].tags, BTreeSet::from(["music".to_string()]));
+        assert_eq!(
+            state.files["track.mp3"].ffn,
+            PathBuf::from("music/track.mp3")
+        );
+        assert_eq!(
+            state.files["track.mp3"].tags,
+            BTreeSet::from(["music".to_string()])
+        );
 
         // by_tags updated
         assert!(state.by_tags["music"].contains("track.mp3"));
@@ -2321,7 +2471,9 @@ mod tests {
         let mut state = make_physical_state(&root);
 
         // Renaming to an existing basename should fail
-        let err = state.rename_file("song.mp3", "heavy.mp3", &root).unwrap_err();
+        let err = state
+            .rename_file("song.mp3", "heavy.mp3", &root)
+            .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
 
         // Original file unchanged
@@ -2363,7 +2515,9 @@ mod tests {
 
         let to_add = BTreeSet::from(["rock".to_string()]);
         let to_remove = BTreeSet::new();
-        state.add_remove_tags("song.mp3", &to_add, &to_remove, &root).unwrap();
+        state
+            .add_remove_tags("song.mp3", &to_add, &to_remove, &root)
+            .unwrap();
 
         // File should now be in music/rock/
         assert!(!root.join("music/song.mp3").exists());
@@ -2383,7 +2537,9 @@ mod tests {
 
         let to_add = BTreeSet::new();
         let to_remove = BTreeSet::from(["rock".to_string()]);
-        state.add_remove_tags("heavy.mp3", &to_add, &to_remove, &root).unwrap();
+        state
+            .add_remove_tags("heavy.mp3", &to_add, &to_remove, &root)
+            .unwrap();
 
         // File should now be in music/ only
         assert!(!root.join("music/rock/heavy.mp3").exists());
@@ -2404,7 +2560,9 @@ mod tests {
 
         let to_add = BTreeSet::new();
         let to_remove = BTreeSet::from(["music".to_string()]);
-        state.add_remove_tags("song.mp3", &to_add, &to_remove, &root).unwrap();
+        state
+            .add_remove_tags("song.mp3", &to_add, &to_remove, &root)
+            .unwrap();
 
         // File should be at source root (untagged)
         assert!(!root.join("music/song.mp3").exists());
@@ -2421,7 +2579,9 @@ mod tests {
 
         let to_add = BTreeSet::from(["photos".to_string()]);
         let to_remove = BTreeSet::from(["music".to_string()]);
-        state.add_remove_tags("song.mp3", &to_add, &to_remove, &root).unwrap();
+        state
+            .add_remove_tags("song.mp3", &to_add, &to_remove, &root)
+            .unwrap();
 
         assert!(!root.join("music/song.mp3").exists());
         assert!(root.join("photos/song.mp3").exists());
@@ -2442,7 +2602,9 @@ mod tests {
         // Add a brand new tag that doesn't exist yet
         let to_add = BTreeSet::from(["jazz".to_string()]);
         let to_remove = BTreeSet::from(["music".to_string()]);
-        state.add_remove_tags("song.mp3", &to_add, &to_remove, &root).unwrap();
+        state
+            .add_remove_tags("song.mp3", &to_add, &to_remove, &root)
+            .unwrap();
 
         assert!(root.join("jazz").is_dir());
         assert!(root.join("jazz/song.mp3").exists());
@@ -2461,7 +2623,9 @@ mod tests {
         let mut state = make_physical_state(&root);
 
         // No adds, no removes = no-op
-        state.add_remove_tags("song.mp3", &BTreeSet::new(), &BTreeSet::new(), &root).unwrap();
+        state
+            .add_remove_tags("song.mp3", &BTreeSet::new(), &BTreeSet::new(), &root)
+            .unwrap();
 
         assert!(root.join("music/song.mp3").exists());
         assert_eq!(
@@ -2488,7 +2652,10 @@ mod tests {
         // Files moved
         assert!(root.join("audio/song.mp3").exists());
         assert!(root.join("audio/rock/heavy.mp3").exists());
-        assert_eq!(fs::read_to_string(root.join("audio/song.mp3")).unwrap(), "song data");
+        assert_eq!(
+            fs::read_to_string(root.join("audio/song.mp3")).unwrap(),
+            "song data"
+        );
 
         // State: files updated
         assert_eq!(
@@ -2500,7 +2667,10 @@ mod tests {
             state.files["heavy.mp3"].tags,
             BTreeSet::from(["audio".to_string(), "rock".to_string()])
         );
-        assert_eq!(state.files["heavy.mp3"].ffn, PathBuf::from("audio/rock/heavy.mp3"));
+        assert_eq!(
+            state.files["heavy.mp3"].ffn,
+            PathBuf::from("audio/rock/heavy.mp3")
+        );
 
         // State: by_tags updated
         assert!(!state.by_tags.contains_key("music"));
@@ -2509,9 +2679,15 @@ mod tests {
         assert!(state.by_tags["audio"].contains("heavy.mp3"));
 
         // State: tagdirs updated
-        assert!(state.tagdirs.contains_key(&BTreeSet::from(["audio".to_string()])));
-        assert!(state.tagdirs.contains_key(&BTreeSet::from(["audio".to_string(), "rock".to_string()])));
-        assert!(!state.tagdirs.contains_key(&BTreeSet::from(["music".to_string()])));
+        assert!(state
+            .tagdirs
+            .contains_key(&BTreeSet::from(["audio".to_string()])));
+        assert!(state
+            .tagdirs
+            .contains_key(&BTreeSet::from(["audio".to_string(), "rock".to_string()])));
+        assert!(!state
+            .tagdirs
+            .contains_key(&BTreeSet::from(["music".to_string()])));
     }
 
     #[test]
@@ -2554,7 +2730,10 @@ mod tests {
             state.files["heavy.mp3"].tags,
             BTreeSet::from(["music".to_string(), "metal".to_string()])
         );
-        assert_eq!(state.files["heavy.mp3"].ffn, PathBuf::from("music/metal/heavy.mp3"));
+        assert_eq!(
+            state.files["heavy.mp3"].ffn,
+            PathBuf::from("music/metal/heavy.mp3")
+        );
         assert!(!state.by_tags.contains_key("rock"));
         assert!(state.by_tags["metal"].contains("heavy.mp3"));
 
@@ -2607,7 +2786,9 @@ mod tests {
         state.rename_file("song.mp3", "track.mp3", &root).unwrap();
         let to_add = BTreeSet::from(["photos".to_string()]);
         let to_remove = BTreeSet::from(["music".to_string()]);
-        state.add_remove_tags("track.mp3", &to_add, &to_remove, &root).unwrap();
+        state
+            .add_remove_tags("track.mp3", &to_add, &to_remove, &root)
+            .unwrap();
 
         assert!(!root.join("music/song.mp3").exists());
         assert!(!root.join("music/track.mp3").exists());
@@ -2696,7 +2877,9 @@ mod tests {
         // First move the file out of photos so the dir is empty
         let to_add = BTreeSet::from(["music".to_string()]);
         let to_remove = BTreeSet::from(["photos".to_string()]);
-        state.add_remove_tags("pic.jpg", &to_add, &to_remove, &root).unwrap();
+        state
+            .add_remove_tags("pic.jpg", &to_add, &to_remove, &root)
+            .unwrap();
 
         // Now rmdir photos
         let photos_tags = BTreeSet::from(["photos".to_string()]);
@@ -2725,12 +2908,19 @@ mod tests {
         let ffn = dir_path.join("new_song.mp3");
         fs::write(root.join(&ffn), "new song data").unwrap();
 
-        state.files.insert("new_song.mp3".to_string(), FileEntry {
-            ffn,
-            tags: tags.clone(),
-        });
+        state.files.insert(
+            "new_song.mp3".to_string(),
+            FileEntry {
+                ffn,
+                tags: tags.clone(),
+            },
+        );
         for tag in &tags {
-            state.by_tags.entry(tag.clone()).or_default().insert("new_song.mp3".to_string());
+            state
+                .by_tags
+                .entry(tag.clone())
+                .or_default()
+                .insert("new_song.mp3".to_string());
         }
 
         assert!(root.join("music/new_song.mp3").exists());
@@ -2756,10 +2946,13 @@ mod tests {
         };
         fs::write(root.join(&ffn), "new data").unwrap();
 
-        state.files.insert("new.txt".to_string(), FileEntry {
-            ffn,
-            tags: tags.clone(),
-        });
+        state.files.insert(
+            "new.txt".to_string(),
+            FileEntry {
+                ffn,
+                tags: tags.clone(),
+            },
+        );
 
         assert!(root.join("new.txt").exists());
         assert!(state.files["new.txt"].tags.is_empty());
@@ -2797,11 +2990,20 @@ mod tests {
         // Files moved
         assert!(root.join("metal/a.txt").exists());
         assert!(root.join("pop/metal/b.txt").exists());
-        assert_eq!(fs::read_to_string(root.join("metal/a.txt")).unwrap(), "a data");
-        assert_eq!(fs::read_to_string(root.join("pop/metal/b.txt")).unwrap(), "b data");
+        assert_eq!(
+            fs::read_to_string(root.join("metal/a.txt")).unwrap(),
+            "a data"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("pop/metal/b.txt")).unwrap(),
+            "b data"
+        );
 
         // State: files updated
-        assert_eq!(state.files["a.txt"].tags, BTreeSet::from(["metal".to_string()]));
+        assert_eq!(
+            state.files["a.txt"].tags,
+            BTreeSet::from(["metal".to_string()])
+        );
         assert_eq!(state.files["a.txt"].ffn, PathBuf::from("metal/a.txt"));
         assert_eq!(
             state.files["b.txt"].tags,
@@ -2816,9 +3018,15 @@ mod tests {
         assert!(state.by_tags["pop"].contains("b.txt"));
 
         // State: tagdirs updated
-        assert!(state.tagdirs.contains_key(&BTreeSet::from(["metal".to_string()])));
-        assert!(state.tagdirs.contains_key(&BTreeSet::from(["metal".to_string(), "pop".to_string()])));
-        assert!(!state.tagdirs.contains_key(&BTreeSet::from(["rock".to_string()])));
+        assert!(state
+            .tagdirs
+            .contains_key(&BTreeSet::from(["metal".to_string()])));
+        assert!(state
+            .tagdirs
+            .contains_key(&BTreeSet::from(["metal".to_string(), "pop".to_string()])));
+        assert!(!state
+            .tagdirs
+            .contains_key(&BTreeSet::from(["rock".to_string()])));
 
         // Untagged file untouched
         assert_eq!(state.files["readme.txt"].ffn, PathBuf::from("readme.txt"));
@@ -2834,15 +3042,26 @@ mod tests {
         // heavy.mp3 has {music, rock}. Remove only {music} (simulating move from /music/ level).
         let to_add = BTreeSet::new();
         let to_remove = BTreeSet::from(["music".to_string()]);
-        state.add_remove_tags("heavy.mp3", &to_add, &to_remove, &root).unwrap();
+        state
+            .add_remove_tags("heavy.mp3", &to_add, &to_remove, &root)
+            .unwrap();
 
         // "rock" tag should be preserved
-        assert_eq!(state.files["heavy.mp3"].tags, BTreeSet::from(["rock".to_string()]));
+        assert_eq!(
+            state.files["heavy.mp3"].tags,
+            BTreeSet::from(["rock".to_string()])
+        );
         // File should now be at rock/heavy.mp3 (not music/rock/heavy.mp3)
-        assert_eq!(state.files["heavy.mp3"].ffn, PathBuf::from("rock/heavy.mp3"));
+        assert_eq!(
+            state.files["heavy.mp3"].ffn,
+            PathBuf::from("rock/heavy.mp3")
+        );
         assert!(!root.join("music/rock/heavy.mp3").exists());
         assert!(root.join("rock/heavy.mp3").exists());
-        assert_eq!(fs::read_to_string(root.join("rock/heavy.mp3")).unwrap(), "heavy data");
+        assert_eq!(
+            fs::read_to_string(root.join("rock/heavy.mp3")).unwrap(),
+            "heavy data"
+        );
 
         // by_tags: removed from music, still in rock
         assert!(!state.by_tags["music"].contains("heavy.mp3"));
@@ -2858,14 +3077,19 @@ mod tests {
         // heavy.mp3 has {music, rock}. Remove both.
         let to_add = BTreeSet::new();
         let to_remove = BTreeSet::from(["music".to_string(), "rock".to_string()]);
-        state.add_remove_tags("heavy.mp3", &to_add, &to_remove, &root).unwrap();
+        state
+            .add_remove_tags("heavy.mp3", &to_add, &to_remove, &root)
+            .unwrap();
 
         // File should be at source root with no tags
         assert!(state.files["heavy.mp3"].tags.is_empty());
         assert_eq!(state.files["heavy.mp3"].ffn, PathBuf::from("heavy.mp3"));
         assert!(!root.join("music/rock/heavy.mp3").exists());
         assert!(root.join("heavy.mp3").exists());
-        assert_eq!(fs::read_to_string(root.join("heavy.mp3")).unwrap(), "heavy data");
+        assert_eq!(
+            fs::read_to_string(root.join("heavy.mp3")).unwrap(),
+            "heavy data"
+        );
 
         // by_tags updated
         assert!(!state.by_tags["music"].contains("heavy.mp3"));
@@ -2884,13 +3108,21 @@ mod tests {
         // readme.txt is untagged at root. Add {photos}.
         let to_add = BTreeSet::from(["photos".to_string()]);
         let to_remove = BTreeSet::new();
-        state.add_remove_tags("readme.txt", &to_add, &to_remove, &root).unwrap();
+        state
+            .add_remove_tags("readme.txt", &to_add, &to_remove, &root)
+            .unwrap();
 
         // File should now be in photos/
         assert!(!root.join("readme.txt").exists());
         assert!(root.join("photos/readme.txt").exists());
-        assert_eq!(state.files["readme.txt"].tags, BTreeSet::from(["photos".to_string()]));
-        assert_eq!(state.files["readme.txt"].ffn, PathBuf::from("photos/readme.txt"));
+        assert_eq!(
+            state.files["readme.txt"].tags,
+            BTreeSet::from(["photos".to_string()])
+        );
+        assert_eq!(
+            state.files["readme.txt"].ffn,
+            PathBuf::from("photos/readme.txt")
+        );
         assert!(state.by_tags["photos"].contains("readme.txt"));
 
         // No longer untagged
@@ -2907,18 +3139,29 @@ mod tests {
         state.rename_file("heavy.mp3", "riff.mp3", &root).unwrap();
         let to_add = BTreeSet::from(["photos".to_string()]);
         let to_remove = BTreeSet::from(["music".to_string(), "rock".to_string()]);
-        state.add_remove_tags("riff.mp3", &to_add, &to_remove, &root).unwrap();
+        state
+            .add_remove_tags("riff.mp3", &to_add, &to_remove, &root)
+            .unwrap();
 
         // Physical: old gone, new exists
         assert!(!root.join("music/rock/heavy.mp3").exists());
         assert!(!root.join("music/rock/riff.mp3").exists());
         assert!(root.join("photos/riff.mp3").exists());
-        assert_eq!(fs::read_to_string(root.join("photos/riff.mp3")).unwrap(), "heavy data");
+        assert_eq!(
+            fs::read_to_string(root.join("photos/riff.mp3")).unwrap(),
+            "heavy data"
+        );
 
         // State
         assert!(!state.files.contains_key("heavy.mp3"));
-        assert_eq!(state.files["riff.mp3"].tags, BTreeSet::from(["photos".to_string()]));
-        assert_eq!(state.files["riff.mp3"].ffn, PathBuf::from("photos/riff.mp3"));
+        assert_eq!(
+            state.files["riff.mp3"].tags,
+            BTreeSet::from(["photos".to_string()])
+        );
+        assert_eq!(
+            state.files["riff.mp3"].ffn,
+            PathBuf::from("photos/riff.mp3")
+        );
         assert!(state.by_tags["photos"].contains("riff.mp3"));
         assert!(!state.by_tags["music"].contains("riff.mp3"));
         assert!(!state.by_tags["rock"].contains("riff.mp3"));
@@ -2966,12 +3209,19 @@ mod tests {
         let dir_path = state.get_dir_for_tags(&tags, &root).unwrap();
         let ffn = dir_path.join("new.mp3");
         fs::write(root.join(&ffn), "new data").unwrap();
-        state.files.insert("new.mp3".to_string(), FileEntry {
-            ffn: ffn.clone(),
-            tags: tags.clone(),
-        });
+        state.files.insert(
+            "new.mp3".to_string(),
+            FileEntry {
+                ffn: ffn.clone(),
+                tags: tags.clone(),
+            },
+        );
         for tag in &tags {
-            state.by_tags.entry(tag.clone()).or_default().insert("new.mp3".to_string());
+            state
+                .by_tags
+                .entry(tag.clone())
+                .or_default()
+                .insert("new.mp3".to_string());
         }
         state.inode_table.get_or_alloc_file("new.mp3");
 
@@ -2980,7 +3230,8 @@ mod tests {
         assert!(state.files.contains_key("new.mp3"));
         assert!(state.by_tags["music"].contains("new.mp3"));
         assert!(state.by_tags["rock"].contains("new.mp3"));
-        let matching = state.get_matching_files(&BTreeSet::from(["music".to_string(), "rock".to_string()]));
+        let matching =
+            state.get_matching_files(&BTreeSet::from(["music".to_string(), "rock".to_string()]));
         assert!(matching.contains("new.mp3"));
 
         // Now unlink
@@ -2998,7 +3249,8 @@ mod tests {
         assert!(!state.files.contains_key("new.mp3"));
         assert!(!state.by_tags["music"].contains("new.mp3"));
         assert!(!state.by_tags["rock"].contains("new.mp3"));
-        let matching = state.get_matching_files(&BTreeSet::from(["music".to_string(), "rock".to_string()]));
+        let matching =
+            state.get_matching_files(&BTreeSet::from(["music".to_string(), "rock".to_string()]));
         assert!(!matching.contains("new.mp3"));
         // heavy.mp3 still there
         assert!(matching.contains("heavy.mp3"));
@@ -3055,8 +3307,12 @@ mod tests {
         assert!(root.join("blues").is_dir());
 
         // State: tagdirs updated
-        assert!(!state.tagdirs.contains_key(&BTreeSet::from(["jazz".to_string()])));
-        assert!(state.tagdirs.contains_key(&BTreeSet::from(["blues".to_string()])));
+        assert!(!state
+            .tagdirs
+            .contains_key(&BTreeSet::from(["jazz".to_string()])));
+        assert!(state
+            .tagdirs
+            .contains_key(&BTreeSet::from(["blues".to_string()])));
 
         // State: by_tags updated
         assert!(!state.by_tags.contains_key("jazz"));
@@ -3064,8 +3320,14 @@ mod tests {
         assert!(state.by_tags["blues"].is_empty());
 
         // No files were affected
-        assert_eq!(state.files["song.mp3"].tags, BTreeSet::from(["music".to_string()]));
-        assert_eq!(state.files["heavy.mp3"].tags, BTreeSet::from(["music".to_string(), "rock".to_string()]));
+        assert_eq!(
+            state.files["song.mp3"].tags,
+            BTreeSet::from(["music".to_string()])
+        );
+        assert_eq!(
+            state.files["heavy.mp3"].tags,
+            BTreeSet::from(["music".to_string(), "rock".to_string()])
+        );
     }
 
     #[test]
@@ -3080,13 +3342,18 @@ mod tests {
         // Try to move song.mp3 from music to photos — should fail with EEXIST
         let to_add = BTreeSet::from(["photos".to_string()]);
         let to_remove = BTreeSet::from(["music".to_string()]);
-        let err = state.add_remove_tags("song.mp3", &to_add, &to_remove, &root).unwrap_err();
+        let err = state
+            .add_remove_tags("song.mp3", &to_add, &to_remove, &root)
+            .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
 
         // Original file unchanged
         assert!(root.join("music/song.mp3").exists());
         assert_eq!(state.files["song.mp3"].ffn, PathBuf::from("music/song.mp3"));
-        assert_eq!(state.files["song.mp3"].tags, BTreeSet::from(["music".to_string()]));
+        assert_eq!(
+            state.files["song.mp3"].tags,
+            BTreeSet::from(["music".to_string()])
+        );
     }
 
     #[test]
@@ -3096,7 +3363,9 @@ mod tests {
         let mut state = make_physical_state(&root);
 
         // rename_file("song.mp3", "song.mp3") — files.contains_key("song.mp3") is true → EEXIST
-        let err = state.rename_file("song.mp3", "song.mp3", &root).unwrap_err();
+        let err = state
+            .rename_file("song.mp3", "song.mp3", &root)
+            .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
 
         // File unchanged
@@ -3131,7 +3400,12 @@ mod tests {
         let mut state = make_physical_state(&root);
 
         let err = state
-            .add_remove_tags("ghost.txt", &BTreeSet::from(["music".to_string()]), &BTreeSet::new(), &root)
+            .add_remove_tags(
+                "ghost.txt",
+                &BTreeSet::from(["music".to_string()]),
+                &BTreeSet::new(),
+                &root,
+            )
             .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
     }
@@ -3147,7 +3421,12 @@ mod tests {
 
         // "music" is already on song.mp3
         state
-            .add_remove_tags("song.mp3", &BTreeSet::from(["music".to_string()]), &BTreeSet::new(), &root)
+            .add_remove_tags(
+                "song.mp3",
+                &BTreeSet::from(["music".to_string()]),
+                &BTreeSet::new(),
+                &root,
+            )
             .unwrap();
 
         // File should be unchanged (new_ffn == old_ffn guard skips rename)
@@ -3167,7 +3446,12 @@ mod tests {
 
         // Remove a tag that song.mp3 doesn't have
         state
-            .add_remove_tags("song.mp3", &BTreeSet::new(), &BTreeSet::from(["nonexistent".to_string()]), &root)
+            .add_remove_tags(
+                "song.mp3",
+                &BTreeSet::new(),
+                &BTreeSet::from(["nonexistent".to_string()]),
+                &root,
+            )
             .unwrap();
 
         // File unchanged
@@ -3207,14 +3491,27 @@ mod tests {
 
         // Tag readme.txt (untagged) with "photos"
         state
-            .add_remove_tags("readme.txt", &BTreeSet::from(["photos".to_string()]), &BTreeSet::new(), &root)
+            .add_remove_tags(
+                "readme.txt",
+                &BTreeSet::from(["photos".to_string()]),
+                &BTreeSet::new(),
+                &root,
+            )
             .unwrap();
-        assert_eq!(state.files["readme.txt"].ffn, PathBuf::from("photos/readme.txt"));
+        assert_eq!(
+            state.files["readme.txt"].ffn,
+            PathBuf::from("photos/readme.txt")
+        );
         assert!(root.join("photos/readme.txt").exists());
 
         // Remove "photos" → back to root
         state
-            .add_remove_tags("readme.txt", &BTreeSet::new(), &BTreeSet::from(["photos".to_string()]), &root)
+            .add_remove_tags(
+                "readme.txt",
+                &BTreeSet::new(),
+                &BTreeSet::from(["photos".to_string()]),
+                &root,
+            )
             .unwrap();
 
         // ffn should be "readme.txt" (not "./readme.txt")
@@ -3234,7 +3531,10 @@ mod tests {
         state.rename_file("song.mp3", "track.mp3", &root).unwrap();
         state.rename_tag("music", "audio", &root).unwrap();
 
-        assert_eq!(state.files["track.mp3"].ffn, PathBuf::from("audio/track.mp3"));
+        assert_eq!(
+            state.files["track.mp3"].ffn,
+            PathBuf::from("audio/track.mp3")
+        );
         assert_eq!(
             state.files["track.mp3"].tags,
             BTreeSet::from(["audio".to_string()])
@@ -3252,7 +3552,12 @@ mod tests {
 
         state.rename_tag("music", "audio", &root).unwrap();
         state
-            .add_remove_tags("song.mp3", &BTreeSet::new(), &BTreeSet::from(["audio".to_string()]), &root)
+            .add_remove_tags(
+                "song.mp3",
+                &BTreeSet::new(),
+                &BTreeSet::from(["audio".to_string()]),
+                &root,
+            )
             .unwrap();
 
         // song.mp3 now untagged at root
@@ -3311,11 +3616,22 @@ mod tests {
         assert!(!state.by_tags.contains_key("rock"));
         assert!(!state.by_tags.contains_key("metal"));
         assert!(state.by_tags.contains_key("heavy_tag"));
-        assert!(!state.tagdirs.contains_key(&BTreeSet::from(["rock".to_string()])));
-        assert!(!state.tagdirs.contains_key(&BTreeSet::from(["metal".to_string()])));
-        assert!(!state.tagdirs.contains_key(&BTreeSet::from(["music".to_string(), "rock".to_string()])));
-        assert!(!state.tagdirs.contains_key(&BTreeSet::from(["music".to_string(), "metal".to_string()])));
-        assert!(state.tagdirs.contains_key(&BTreeSet::from(["music".to_string(), "heavy_tag".to_string()])));
+        assert!(!state
+            .tagdirs
+            .contains_key(&BTreeSet::from(["rock".to_string()])));
+        assert!(!state
+            .tagdirs
+            .contains_key(&BTreeSet::from(["metal".to_string()])));
+        assert!(!state
+            .tagdirs
+            .contains_key(&BTreeSet::from(["music".to_string(), "rock".to_string()])));
+        assert!(!state
+            .tagdirs
+            .contains_key(&BTreeSet::from(["music".to_string(), "metal".to_string()])));
+        assert!(state.tagdirs.contains_key(&BTreeSet::from([
+            "music".to_string(),
+            "heavy_tag".to_string()
+        ])));
 
         // Physical
         assert!(root.join("music/heavy_tag/heavy.mp3").exists());
@@ -3334,12 +3650,19 @@ mod tests {
         let dir_path = state.get_dir_for_tags(&tags, &root).unwrap();
         let ffn = dir_path.join("new_song.mp3");
         fs::write(root.join(&ffn), "new song data").unwrap();
-        state.files.insert("new_song.mp3".to_string(), FileEntry {
-            ffn,
-            tags: tags.clone(),
-        });
+        state.files.insert(
+            "new_song.mp3".to_string(),
+            FileEntry {
+                ffn,
+                tags: tags.clone(),
+            },
+        );
         for tag in &tags {
-            state.by_tags.entry(tag.clone()).or_default().insert("new_song.mp3".to_string());
+            state
+                .by_tags
+                .entry(tag.clone())
+                .or_default()
+                .insert("new_song.mp3".to_string());
         }
 
         // Now retag: move from music to rock
@@ -3396,7 +3719,8 @@ mod tests {
         // Try to rmdir "photos" which contains pic.jpg
         let photos_tags = BTreeSet::from(["photos".to_string()]);
         let dirs = state.tagdirs.get(&photos_tags).unwrap().clone();
-        let result = dirs.iter()
+        let result = dirs
+            .iter()
             .map(|d| fs::remove_dir(root.join(d)))
             .find(|r| r.is_err());
 
@@ -3405,9 +3729,9 @@ mod tests {
         let err = result.unwrap().unwrap_err();
         // On Linux this is ENOTEMPTY
         assert!(
-            err.raw_os_error() == Some(libc::ENOTEMPTY) ||
-            err.raw_os_error() == Some(libc::EEXIST), // Some systems use EEXIST
-            "Expected ENOTEMPTY or EEXIST, got {:?}", err
+            err.raw_os_error() == Some(libc::ENOTEMPTY) || err.raw_os_error() == Some(libc::EEXIST), // Some systems use EEXIST
+            "Expected ENOTEMPTY or EEXIST, got {:?}",
+            err
         );
 
         // Directory still exists, state unchanged
@@ -3651,7 +3975,10 @@ mod tests {
         fs::write(root.join("music/song.mp3"), "different content").unwrap();
 
         assert_eq!(state.files["song.mp3"].ffn, PathBuf::from("music/song.mp3"));
-        assert_eq!(state.files["song.mp3"].tags, BTreeSet::from(["music".to_string()]));
+        assert_eq!(
+            state.files["song.mp3"].tags,
+            BTreeSet::from(["music".to_string()])
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3821,4 +4148,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-

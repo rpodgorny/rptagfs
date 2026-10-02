@@ -164,8 +164,7 @@ fn scan_dir(
             let tags = file_path_to_tags(&rel_path);
             let original_bn = name_str.to_string();
             let start = next_suffix.get(&original_bn).copied().unwrap_or(1);
-            let (bn, next) =
-                find_free_bn(&original_bn, start, |n| result.files.contains_key(n));
+            let (bn, next) = find_free_bn(&original_bn, start, |n| result.files.contains_key(n));
             next_suffix.insert(original_bn.clone(), next);
             if bn != original_bn {
                 log::debug!("Collision resolved: {:?} -> {:?}", original_bn, bn);
@@ -209,7 +208,13 @@ pub fn scan_tree(root: &Path, show_hidden: bool) -> ScanResult {
         tagdirs: HashMap::new(),
         by_tags: HashMap::new(),
     };
-    scan_dir(root, Path::new(""), show_hidden, &mut result, &mut HashMap::new());
+    scan_dir(
+        root,
+        Path::new(""),
+        show_hidden,
+        &mut result,
+        &mut HashMap::new(),
+    );
     result
 }
 
@@ -314,25 +319,37 @@ mod tests {
     #[test]
     fn find_free_bn_no_collision() {
         let existing: HashSet<String> = HashSet::new();
-        assert_eq!(find_free_bn("file.txt", 1, |n| existing.contains(n)).0, "file.txt");
+        assert_eq!(
+            find_free_bn("file.txt", 1, |n| existing.contains(n)).0,
+            "file.txt"
+        );
     }
 
     #[test]
     fn find_free_bn_one_collision() {
         let existing: HashSet<String> = HashSet::from(["file.txt".into()]);
-        assert_eq!(find_free_bn("file.txt", 1, |n| existing.contains(n)).0, "file.__1.txt");
+        assert_eq!(
+            find_free_bn("file.txt", 1, |n| existing.contains(n)).0,
+            "file.__1.txt"
+        );
     }
 
     #[test]
     fn find_free_bn_multi_collision() {
         let existing: HashSet<String> = HashSet::from(["file.txt".into(), "file.__1.txt".into()]);
-        assert_eq!(find_free_bn("file.txt", 1, |n| existing.contains(n)).0, "file.__2.txt");
+        assert_eq!(
+            find_free_bn("file.txt", 1, |n| existing.contains(n)).0,
+            "file.__2.txt"
+        );
     }
 
     #[test]
     fn find_free_bn_no_ext() {
         let existing: HashSet<String> = HashSet::from(["README".into()]);
-        assert_eq!(find_free_bn("README", 1, |n| existing.contains(n)).0, "README.__1");
+        assert_eq!(
+            find_free_bn("README", 1, |n| existing.contains(n)).0,
+            "README.__1"
+        );
     }
 
     #[test]
@@ -656,11 +673,8 @@ mod tests {
 
         assert_eq!(result.files.len(), 2);
         // One file has empty tags, the other has {"tag1"}
-        let tags_sets: HashSet<BTreeSet<String>> = result
-            .files
-            .values()
-            .map(|e| e.tags.clone())
-            .collect();
+        let tags_sets: HashSet<BTreeSet<String>> =
+            result.files.values().map(|e| e.tags.clone()).collect();
         assert!(tags_sets.contains(&BTreeSet::new()));
         assert!(tags_sets.contains(&BTreeSet::from(["tag1".into()])));
     }
@@ -694,7 +708,10 @@ mod tests {
     fn find_free_bn_hidden_file_collision() {
         // ".hidden" → split_ext returns (".hidden", "") since rfind('.') pos=0 fails pos > 0
         let existing = HashSet::from([".hidden".to_string()]);
-        assert_eq!(find_free_bn(".hidden", 1, |n| existing.contains(n)).0, ".hidden.__1");
+        assert_eq!(
+            find_free_bn(".hidden", 1, |n| existing.contains(n)).0,
+            ".hidden.__1"
+        );
     }
 
     #[test]
@@ -718,7 +735,10 @@ mod tests {
             "f.__1.txt".to_string(),
             "f.__3.txt".to_string(),
         ]);
-        assert_eq!(find_free_bn("f.txt", 1, |n| existing.contains(n)).0, "f.__2.txt");
+        assert_eq!(
+            find_free_bn("f.txt", 1, |n| existing.contains(n)).0,
+            "f.__2.txt"
+        );
     }
 
     #[test]
@@ -743,4 +763,3 @@ mod tests {
             .contains_key(&BTreeSet::from(["tag3".into()])));
     }
 }
-

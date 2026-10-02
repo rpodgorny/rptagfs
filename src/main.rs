@@ -42,7 +42,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let source_dir = args.source_dir.canonicalize()?;
 
-    log::info!("Mounting at {:?}, show_hidden={}", args.mount_point, args.show_hidden);
+    log::info!(
+        "Mounting at {:?}, show_hidden={}",
+        args.mount_point,
+        args.show_hidden
+    );
     log::info!("Scanning source directory: {:?}", source_dir);
     let scan_result = scanner::scan_tree(&source_dir, args.show_hidden);
     log::info!(
