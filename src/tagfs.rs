@@ -1686,7 +1686,7 @@ mod tests {
         let ino = tbl.get_or_alloc_file("f.txt");
         tbl.remove_file("f.txt");
         assert!(tbl.get(ino).is_none());
-        assert!(tbl.file_to_inode.get("f.txt").is_none());
+        assert!(!tbl.file_to_inode.contains_key("f.txt"));
     }
 
     #[test]
@@ -1696,7 +1696,7 @@ mod tests {
         let ino = tbl.get_or_alloc_dir(&tags);
         tbl.remove_dir(&tags);
         assert!(tbl.get(ino).is_none());
-        assert!(tbl.dir_to_inode.get(&tags).is_none());
+        assert!(!tbl.dir_to_inode.contains_key(&tags));
     }
 
     // --- Helper to build a test FsState ---
@@ -3375,7 +3375,7 @@ mod tests {
 
         // Old inode gone
         assert!(state.inode_table.get(old_ino).is_none());
-        assert!(state.inode_table.file_to_inode.get("song.mp3").is_none());
+        assert!(!state.inode_table.file_to_inode.contains_key("song.mp3"));
 
         // New inode allocated for track.mp3
         let new_ino = *state.inode_table.file_to_inode.get("track.mp3").unwrap();
