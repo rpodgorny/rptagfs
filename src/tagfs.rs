@@ -133,6 +133,11 @@ impl InodeTable {
 /// silently dropped and duplicated entries on directories big enough to page
 /// (~14k of 40k files missing, ~10k repeated). Tag entries come from a
 /// BTreeSet and are already ordered; only file names need this.
+/// Render a tag set the way the tag change log prints it.
+fn fmt_tags(tags: &BTreeSet<String>) -> String {
+    tags.iter().cloned().collect::<Vec<_>>().join(",")
+}
+
 fn sorted_names(names: &HashSet<String>) -> Vec<&String> {
     let mut v: Vec<&String> = names.iter().collect();
     v.sort_unstable();
@@ -391,6 +396,13 @@ impl FsState {
         self.inode_table.remove_file(old_bn);
         self.inode_table.get_or_alloc_file(new_bn);
 
+        log::debug!(
+            "tag change: {} renamed to {} [{}]",
+            old_bn,
+            new_bn,
+            fmt_tags(&tags)
+        );
+
         Ok(())
     }
 
@@ -443,7 +455,7 @@ impl FsState {
         // Update files map
         let entry = self.files.get_mut(bn).unwrap();
         entry.ffn = new_ffn;
-        entry.tags = new_tags;
+        entry.tags = new_tags.clone();
 
         // Update by_tags: add
         for tag in tags_to_add {
@@ -457,6 +469,15 @@ impl FsState {
             if let Some(set) = self.by_tags.get_mut(tag) {
                 set.remove(bn);
             }
+        }
+
+        if new_tags != old_tags {
+            log::debug!(
+                "tag change: {} [{}] -> [{}]",
+                bn,
+                fmt_tags(&old_tags),
+                fmt_tags(&new_tags)
+            );
         }
 
         Ok(())
@@ -566,11 +587,18 @@ impl FsState {
         self.by_tags.insert(new_tag.to_string(), file_set);
 
         // Update files: replace tag in tags set and ffn
-        for entry in self.files.values_mut() {
+        for (bn, entry) in self.files.iter_mut() {
             if entry.tags.contains(old_tag) {
+                let old_tags = entry.tags.clone();
                 entry.tags.remove(old_tag);
                 entry.tags.insert(new_tag.to_string());
                 entry.ffn = Self::replace_tag_in_path(&entry.ffn, old_tag, new_tag);
+                log::debug!(
+                    "tag change: {} [{}] -> [{}]",
+                    bn,
+                    fmt_tags(&old_tags),
+                    fmt_tags(&entry.tags)
+                );
             }
         }
 
@@ -1453,6 +1481,8 @@ impl Filesystem for TagFs {
             }
             state.inode_table.remove_file(&name_str);
 
+            log::debug!("tag change: {} deleted [{}]", name_str, fmt_tags(&tags));
+
             Ok(())
         })
     }
@@ -1612,6 +1642,7 @@ impl Filesystem for TagFs {
                     .or_default()
                     .insert(name_str.clone());
             }
+            log::debug!("tag change: {} created [{}]", name_str, fmt_tags(&tags));
             state
                 .files
                 .insert(name_str.clone(), FileEntry { ffn, tags });
